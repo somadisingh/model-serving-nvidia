@@ -15,7 +15,7 @@ Image (3840px wide) → Resize/CenterCrop to 224×224
 
 ## Dataset
 
-Images sourced from Pixabay, organized into `train/`, `test/`, `validation/` splits with flat numbered filenames (`1.jpeg`, `2.jpeg`, ...). Labels (aesthetic scores) and metadata are stored in accompanying CSV files (`metadata.csv`, `tags.csv`). Images were originally larger than UHD-1 (3840×2160) and have been downscaled to 3840px width maintaining aspect ratio.
+Images sourced from Pixabay, organized into `train/`, `test/`, `validation/` splits with flat numbered filenames (`1.jpeg`, `2.jpeg`, ...). Labels (aesthetic scores) and metadata are stored in accompanying CSV files (`uhd-iqa-metadata.csv`, `uhd-iqa-tags.csv`). Images were originally larger than UHD-1 (3840×2160) and have been downscaled to 3840px width maintaining aspect ratio.
 
 ## What this lab covers
 

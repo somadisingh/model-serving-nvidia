@@ -41,6 +41,6 @@ Finally, verify that the data looks as it should. Start a shell in a temporary c
 docker run --rm -it -v aesthetic_data:/mnt alpine ls -l /mnt/aesthetic-hub/
 ```
 
-it should show "test" and "validation" subfolders, along with "metadata.csv" and "tags.csv".
+it should show "test" and "validation" subfolders, along with "uhd-iqa-metadata.csv" and "uhd-iqa-tags.csv".
 
 :::

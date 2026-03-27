@@ -23,5 +23,9 @@ services:
         unzip -q aesthetic-hub-data.zip
         rm aesthetic-hub-data.zip
 
+        echo "Flattening directory structure..."
+        mv aesthetic-hub-data/* .
+        rm -rf aesthetic-hub-data __MACOSX .DS_Store
+
         echo "Dataset setup complete."
     restart: "no"
