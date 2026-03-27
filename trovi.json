@@ -1,0 +1,19 @@
+{
+  "title": "Model Optimizations for Aesthetic Score Prediction",
+  "short_description": "Benchmark and optimize a two-stage image aesthetic scoring pipeline (CLIP ViT-L/14 + MLP) on NVIDIA GPU and CPU using PyTorch, ONNX, quantization, and hardware-specific execution providers.",
+  "tags": [
+    "model-serving",
+    "inference-optimization",
+    "onnx",
+    "quantization",
+    "gpu",
+    "nvidia",
+    "clip",
+    "pytorch"
+  ],
+  "linked_projects": [],
+  "reproducibility": {
+    "enable_repro_requests": true,
+    "access_hours": 3
+  }
+}

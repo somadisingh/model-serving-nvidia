@@ -126,7 +126,7 @@ Now, we can use `python-chi` to execute commands on the instance, to set it up. 
 ::: {.cell .code}
 ```python
 # runs in Chameleon Jupyter environment
-s.execute("git clone https://github.com/somadisingh/model-serving-nvidia")
+s.execute("git clone -b deployment-pipeline https://github.com/somadisingh/model-serving-nvidia")
 ```
 :::
 
