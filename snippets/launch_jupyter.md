@@ -8,7 +8,7 @@ Inside the SSH session, build the `jupyter-onnx-base` image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-base -f serve-model-chi/docker/Dockerfile.jupyter-onnx-base .
+docker build -t jupyter-onnx-base -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-base .
 ```
 
 Then, launch a container from the `jupyter-onnx-base` image:
@@ -17,9 +17,9 @@ Then, launch a container from the `jupyter-onnx-base` image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v aesthetic_data:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-base
 ```

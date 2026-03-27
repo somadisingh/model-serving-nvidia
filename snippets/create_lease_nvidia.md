@@ -46,6 +46,6 @@ At the beginning of your GPU lease time, you will continue with the next step, i
 * Use this link: [Model optimizations for serving machine learning models](https://chameleoncloud.org/experiment/share/f5acccf8-f2cb-4d1e-8918-4c8fd97bfc32) on Trovi
 * Then, click "Launch on Chameleon". This will start a new Jupyter server for you, with the experiment materials already in it, including the notebook to bring up the bare metal server.
 
-Inside the `serve-model-chi` directory, continue with `2_create_server.ipynb`.
+Inside the `model-serving-nvidia` directory, continue with `2_create_server.ipynb`.
 
 :::

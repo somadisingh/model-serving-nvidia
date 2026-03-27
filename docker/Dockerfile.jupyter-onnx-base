@@ -2,6 +2,7 @@ FROM quay.io/jupyter/pytorch-notebook:pytorch-2.5.1
 
 USER ${NB_UID}
 RUN pip install --pre --no-cache-dir \
+    'clip @ git+https://github.com/openai/CLIP.git' \
     'onnx==1.18.0' \
     'onnxruntime' \
     'neural-compressor==3.6' && \

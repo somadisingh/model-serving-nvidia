@@ -18,15 +18,15 @@ To run this experiment, you should have already created an account on Chameleon,
 ## Context
 
 
-The premise of this example is as follows: You are working as a machine learning engineer at a small startup company called GourmetGram. They are developing an online photo sharing community focused on food. You have developed a convolutional neural network in Pytorch that automatically classifies photos of food into one of a set of categories: Bread, Dairy product, Dessert, Egg, Fried food, Meat, Noodles/Pasta, Rice, Seafood, Soup, and Vegetable/Fruit.
+The premise of this example is as follows: You are working as a machine learning engineer at a small startup. You have developed a two-stage image aesthetic scoring pipeline: a frozen CLIP ViT-L/14 vision encoder produces a 768-dimensional embedding, which is then fed through a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that outputs a continuous aesthetic quality score from 0 to 10.
 
-Now that you have trained a model, you are preparing to serve predictions using this model. Your manager has advised that since GourmetGram is an early-stage startup, they can't afford much compute for serving models. Your manager wants you to prepare a few different options, that they will then price out among cloud providers and decide which to use:
+Now that you have trained the MLP head, you are preparing to serve predictions using this model. Your manager has advised that since you are an early-stage startup, they can't afford much compute for serving models. Your manager wants you to prepare a few different options, that they will then price out among cloud providers and decide which to use:
 
 * inference on a server-grade CPU (AMD EPYC 7763). Your manager wants to see an option that has less than 3ms median inference latency for a single input sample, and has a batch throughput of at least 1000 frames per second.
-* inference on a server-grade GPU (NVIDIA A30 or A100). Since GourmetGram won't be able to afford to load balance across several GPUs, your manager said that the GPU option must have strong enough performance to handle the workload with a single GPU node: they are looking for less than 1ms median inference latency for a single input sample, and a batch throughput of at least 5000 frames per second.
+* inference on a server-grade GPU (NVIDIA A30 or A100). Since the startup won't be able to afford to load balance across several GPUs, your manager said that the GPU option must have strong enough performance to handle the workload with a single GPU node: they are looking for less than 1ms median inference latency for a single input sample, and a batch throughput of at least 5000 frames per second.
 * inference on end-user devices, as part of an app. For this option, the model itself should be less than 5MB on disk, because users are sensitive to storage space on mobile devices. Because the total prediction time will not include any network delay when the model is on the end-user device, the "budget" for inference time is larger: your manager wants less than 15ms median inference latency for a single input sample on a low-resource edge device (ARM Cortex A76 processor).
 
-You're already off to a good start, by using a MobileNetV2 as your foundation model; this is a small model that is especially designed for fast inference time. Now you need to measure the inference performance of the model and, if it doesn't meet the requirements above, investigate ways to improve it.
+You're already off to a good start, by using a lightweight MLP head on top of CLIP ViT-L/14 embeddings; the MLP is a small model that is especially well-suited for fast inference time. Now you need to measure the inference performance of the model and, if it doesn't meet the requirements above, investigate ways to improve it.
 
 
 
@@ -82,7 +82,7 @@ At the beginning of your GPU lease time, you will continue with the next step, i
 * Use this link: [Model optimizations for serving machine learning models](https://chameleoncloud.org/experiment/share/f5acccf8-f2cb-4d1e-8918-4c8fd97bfc32) on Trovi
 * Then, click "Launch on Chameleon". This will start a new Jupyter server for you, with the experiment materials already in it, including the notebook to bring up the bare metal server.
 
-Inside the `serve-model-chi` directory, continue with `2_create_server.ipynb`.
+Inside the `model-serving-nvidia` directory, continue with `2_create_server.ipynb`.
 
 
 
@@ -183,7 +183,7 @@ Now, we can use `python-chi` to execute commands on the instance, to set it up. 
 
 ```python
 # runs in Chameleon Jupyter environment
-s.execute("git clone https://github.com/teaching-on-testbeds/serve-model-chi")
+s.execute("git clone https://github.com/somadisingh/model-serving-nvidia")
 ```
 
 
@@ -240,7 +240,7 @@ where
 
 ## Prepare data
 
-For the rest of this tutorial, we'll be training models on the [Food-11 dataset](https://www.epfl.ch/labs/mmspg/downloads/food-image-datasets/). We're going to prepare a Docker volume with this dataset already prepared on it, so that the containers we create later can attach to this volume and access the data. 
+For the rest of this tutorial, we'll use an aesthetic image scoring dataset hosted on [HuggingFace](https://huggingface.co/datasets/somadisingh/aesthetic-hub). We're going to prepare a Docker volume with this dataset already prepared on it, so that the containers we create later can attach to this volume and access the data. 
 
 
 
@@ -249,17 +249,17 @@ First, create the volume:
 
 ```bash
 # runs on node-serve-model
-docker volume create food11
+docker volume create aesthetic_data
 ```
 
 Then, to populate it with data, run
 
 ```bash
 # runs on node-serve-model
-docker compose -f serve-model-chi/docker/docker-compose-data.yaml up -d
+docker compose -f model-serving-nvidia/docker/docker-compose-data.yaml up -d
 ```
 
-This will run a temporary container that downloads the Food-11 dataset, organizes it in the volume, and then stops. It may take a minute or two. You can verify with 
+This will run a temporary container that downloads the aesthetic scoring dataset from HuggingFace, extracts it in the volume, and then stops. It may take a few minutes depending on your connection speed (the dataset is ~3.3 GB). You can verify with 
 
 ```bash
 # runs on node-serve-model
@@ -271,11 +271,11 @@ that it is done - when there are no running containers.
 Finally, verify that the data looks as it should. Start a shell in a temporary container with this volume attached, and `ls` the contents of the volume:
 
 ```bash
-# runs on node-mltrain
-docker run --rm -it -v food11:/mnt alpine ls -l /mnt/Food-11/
+# runs on node-serve-model
+docker run --rm -it -v aesthetic_data:/mnt alpine ls -l /mnt/aesthetic-hub/
 ```
 
-it should show "evaluation", "validation", and "training" subfolders.
+it should show "test" and "validation" subfolders, along with "uhd-iqa-metadata.csv" and "uhd-iqa-tags.csv".
 
 
 
@@ -285,7 +285,7 @@ Inside the SSH session, build the `jupyter-onnx-base` image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-base -f serve-model-chi/docker/Dockerfile.jupyter-onnx-base .
+docker build -t jupyter-onnx-base -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-base .
 ```
 
 Then, launch a container from the `jupyter-onnx-base` image:
@@ -294,9 +294,9 @@ Then, launch a container from the `jupyter-onnx-base` image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v aesthetic_data:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-base
 ```
@@ -324,10 +324,15 @@ Then, in the file browser on the left side, open the "work" directory and then c
 
 ## Measure inference performance of PyTorch model on CPU 
 
-First, we are going to measure the inference performance of an already-trained PyTorch model on CPU. After completing this section, you should understand:
+First, we are going to measure the inference performance of an already-trained PyTorch model on CPU. Our full inference pipeline has two stages:
 
-* how to measure the inference latency of a PyTorch model
-* how to measure the throughput of batch inference of a PyTorch model
+1. **CLIP ViT-L/14** (image encoder): Takes a raw image and produces a 768-dimensional embedding vector
+2. **Aesthetic MLP head**: Takes the 768-dim embedding and produces an aesthetic quality score (0-10)
+
+We will benchmark each stage independently, then measure the end-to-end pipeline. After completing this section, you should understand:
+
+* how to measure the inference latency and throughput of a PyTorch model
+* the relative cost of the image encoder (ViT) vs the downstream head (MLP)
 * how to compare eager model execution vs a compiled model
 
 You will execute this notebook *in a Jupyter container running on a compute instance*, not on the general-purpose Chameleon Jupyter environment from which you provision resources.
@@ -338,275 +343,469 @@ You will execute this notebook *in a Jupyter container running on a compute inst
 import os
 import torch
 from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+from torchvision import datasets
 import time
 import numpy as np
+import clip
 ```
 
 
 
-First, let's load our saved model in evaluation mode. Note that for now, we will use the CPU for inference, not GPU.
+First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute image embeddings). Note that for now, we will use the CPU for inference, not GPU.
 
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/food11.pth"  
+model_path = "models/aesthetic_mlp.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
-model.eval()  
+model.eval()
+
+# Load CLIP model for computing image embeddings
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
 ```
 
 
-and also prepare our test dataset:
+and also prepare our test dataset, using CLIP's own preprocessing:
 
 
 ```python
 # runs in jupyter container on node-serve-model
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 
 
 
-We will measure:
+---
 
-* the size of the model on disk
-* the latency when doing inference on single samples
-* the throughput when doing inference on batches of data
-* and the test accuracy
+## Part 1: CLIP ViT-L/14 Image Encoder (CPU)
 
+The ViT-L/14 model is the computationally expensive part of the pipeline. It processes raw images (224×224) through a Vision Transformer to produce 768-dimensional embeddings. Let's measure its performance on CPU in **eager mode** first.
 
 
 
-#### Model size
+#### ViT model size
 
-We'll start with model size. Our default `food11.pth` is a finetuned MobileNetV2, which is a small model designed for deployment on edge devices, so it is fairly small.
 
 ```python
 # runs in jupyter container on node-serve-model
-model_size = os.path.getsize(model_path) 
-print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
+# CLIP downloads the ViT model to ~/.cache/clip/
+clip_cache_dir = os.path.expanduser("~/.cache/clip")
+vit_model_file = os.path.join(clip_cache_dir, "ViT-L-14.pt")
+if os.path.exists(vit_model_file):
+    vit_model_size = os.path.getsize(vit_model_file)
+    print(f"ViT-L/14 Model Size on Disk: {vit_model_size / (1e6):.2f} MB")
+else:
+    print(f"ViT model file not found at {vit_model_file}")
+    # Estimate from parameters
+    vit_params = sum(p.numel() * p.element_size() for p in clip_model.visual.parameters())
+    print(f"ViT-L/14 Visual Encoder Size (in memory): {vit_params / (1e6):.2f} MB")
 ```
 
 
-#### Test accuracy
-
-Next, we'll measure the accuracy of this model on the test data
+#### ViT single-image latency (eager mode)
 
 
 ```python
 # runs in jupyter container on node-serve-model
-correct = 0
-total = 0
+num_trials = 100
+
+# Get a single preprocessed image
+single_image, _ = next(iter(test_loader))
+single_image = single_image[:1].to(device)
+
+# Warm-up
 with torch.no_grad():
-    for images, labels in test_loader:
-        outputs = model(images)
-        _, predicted = torch.max(outputs, 1)  # Get predicted class index
-        total += labels.size(0)
-        correct += (predicted == labels).sum().item()
+    clip_model.encode_image(single_image)
 
-accuracy = (correct / total) * 100
-```
-
-```python
-# runs in jupyter container on node-serve-model
-print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
-```
-
-
-
-
-#### Inference latency
-
-Now, we'll measure how long it takes the model to return a prediction for a single sample. We will run 100 trials, and then compute aggregate statistics.
-
-
-```python
-# runs in jupyter container on node-serve-model
-num_trials = 100  # Number of trials
-
-# Get a single sample from the test data
-
-single_sample, _ = next(iter(test_loader))  
-single_sample = single_sample[0].unsqueeze(0)  
-
-# Warm-up run 
-with torch.no_grad():
-    model(single_sample)
-
-latencies = []
+vit_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
         start_time = time.time()
-        _ = model(single_sample)
-        latencies.append(time.time() - start_time)
+        clip_model.encode_image(single_image)
+        latencies_i = time.time() - start_time
+        vit_latencies_eager.append(latencies_i)
+
+print("ViT-L/14 Single Image Latency (Eager, CPU):")
+print(f"  Median: {np.percentile(vit_latencies_eager, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(vit_latencies_eager, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(vit_latencies_eager, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(vit_latencies_eager):.2f} FPS")
 ```
 
+
+#### ViT batch throughput (eager mode)
+
+We'll test with a batch of 32 images (matching our DataLoader batch size).
 
 
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
-print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
-```
+num_batches = 50
+batch_images, _ = next(iter(test_loader))
+batch_images = batch_images.to(device)
 
-
-#### Batch throughput 
-
-Finally, we'll measure the rate at which the model can return predictions for batches of data. 
-
-
-```python
-# runs in jupyter container on node-serve-model
-num_batches = 50  # Number of trials
-
-# Get a batch from the test data
-batch_input, _ = next(iter(test_loader))  
-
-# Warm-up run 
+# Warm-up
 with torch.no_grad():
-    model(batch_input)
+    clip_model.encode_image(batch_images)
 
-batch_times = []
+vit_batch_times_eager = []
 with torch.no_grad():
     for _ in range(num_batches):
         start_time = time.time()
-        _ = model(batch_input)
-        batch_times.append(time.time() - start_time)
+        clip_model.encode_image(batch_images)
+        vit_batch_times_eager.append(time.time() - start_time)
+
+vit_batch_fps_eager = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_eager)
+print(f"ViT-L/14 Batch Throughput (Eager, CPU, batch_size=32): {vit_batch_fps_eager:.2f} FPS")
+```
+
+
+
+#### ViT compiled mode (CPU)
+
+Now let's compile the ViT visual encoder into a graph and see if we get a speedup. Graph compilation can fuse operations and optimize memory access patterns.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Compile the visual encoder
+clip_model.visual = torch.compile(clip_model.visual)
+
+# Warm-up (first call triggers compilation, which is slow)
+print("Compiling ViT visual encoder (this may take a moment)...")
+with torch.no_grad():
+    clip_model.encode_image(single_image)
+print("Compilation complete.")
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-batch_fps = (batch_input.shape[0] * num_batches) / np.sum(batch_times) 
-print(f"Batch Throughput: {batch_fps:.2f} FPS")
+# Single-image latency (compiled)
+vit_latencies_compiled = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        clip_model.encode_image(single_image)
+        vit_latencies_compiled.append(time.time() - start_time)
+
+print("ViT-L/14 Single Image Latency (Compiled, CPU):")
+print(f"  Median: {np.percentile(vit_latencies_compiled, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(vit_latencies_compiled, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(vit_latencies_compiled, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(vit_latencies_compiled):.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Batch throughput (compiled)
+vit_batch_times_compiled = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        clip_model.encode_image(batch_images)
+        vit_batch_times_compiled.append(time.time() - start_time)
+
+vit_batch_fps_compiled = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_compiled)
+print(f"ViT-L/14 Batch Throughput (Compiled, CPU, batch_size=32): {vit_batch_fps_compiled:.2f} FPS")
 ```
 
 
-
-#### Summary of results
+#### ViT CPU summary
 
 
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
-print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
-print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
-print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
-print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
-print(f"Batch Throughput: {batch_fps:.2f} FPS")
+print("=" * 60)
+print("CLIP ViT-L/14 CPU Benchmark Summary")
+print("=" * 60)
+print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
+print("-" * 60)
+print(f"{'Single image latency (median, ms)':<45} {np.percentile(vit_latencies_eager, 50)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 50)*1000:>8.2f}")
+print(f"{'Single image latency (p95, ms)':<45} {np.percentile(vit_latencies_eager, 95)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 95)*1000:>8.2f}")
+print(f"{'Single image throughput (FPS)':<45} {num_trials/np.sum(vit_latencies_eager):>8.2f} {num_trials/np.sum(vit_latencies_compiled):>8.2f}")
+print(f"{'Batch throughput (FPS, batch_size=32)':<45} {vit_batch_fps_eager:>8.2f} {vit_batch_fps_compiled:>8.2f}")
 ```
 
-<!-- 
-
-compute_gigaio 
-
-  Model name:             AMD EPYC 7763 64-Core Processor
-    CPU family:           25
-    Model:                1
-    Thread(s) per core:   2
-    Core(s) per socket:   64
-
--->
 
 
-<!-- summary for mobilenet model
+---
 
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 60.16 ms
-Inference Latency (single sample, 95th percentile): 77.22 ms
-Inference Latency (single sample, 99th percentile): 77.37 ms
-Inference Throughput (single sample): 15.82 FPS
-Batch Throughput: 83.66 FPS
+## Part 2: Aesthetic MLP Head (CPU)
 
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 73.97 ms
-Inference Latency (single sample, 95th percentile): 83.16 ms
-Inference Latency (single sample, 99th percentile): 83.94 ms
-Inference Throughput (single sample): 13.34 FPS
-Batch Throughput: 98.80 FPS
-
--->
-
-
-<!-- summary for mobilenet compiled model
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 26.92 ms
-Inference Latency (single sample, 95th percentile): 49.79 ms
-Inference Latency (single sample, 99th percentile): 64.55 ms
-Inference Throughput (single sample): 32.35 FPS
-Batch Throughput: 249.08 FPS
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 34.14 ms
-Inference Latency (single sample, 95th percentile): 53.85 ms
-Inference Latency (single sample, 99th percentile): 60.23 ms
-Inference Throughput (single sample): 27.39 FPS
-Batch Throughput: 281.65 FPS
-
--->
-
-<!-- 
-
-(Intel CPU)
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 12.69 ms
-Inference Latency (single sample, 95th percentile): 12.83 ms
-Inference Latency (single sample, 99th percentile): 12.97 ms
-Inference Throughput (single sample): 78.73 FPS
-Batch Throughput: 161.27 FPS
-
-With compiling
-
-Model Size on Disk: 9.23 MB
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 8.47 ms
-Inference Latency (single sample, 95th percentile): 8.58 ms
-Inference Latency (single sample, 99th percentile): 8.79 ms
-Inference Throughput (single sample): 117.86 FPS
-Batch Throughput: 474.67 FPS
+Now we'll benchmark the lightweight MLP head that maps 768-dim CLIP embeddings to aesthetic scores. Since we'll compare eager vs compiled mode, we'll first reload the models fresh.
 
 
 
--->
+```python
+# runs in jupyter container on node-serve-model
+# Reload CLIP (uncompiled) and MLP for clean benchmarking
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+model = torch.load(model_path, map_location=device, weights_only=False)
+model.eval()
+```
+
+
+
+#### MLP model size
+
+Our `aesthetic_mlp.pth` is a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that maps CLIP ViT-L/14 embeddings to aesthetic scores, so it is very small.
+
+```python
+# runs in jupyter container on node-serve-model
+mlp_model_size = os.path.getsize(model_path) 
+print(f"MLP Model Size on Disk: {mlp_model_size / (1e6):.2f} MB")
+```
+
+
+#### Sample predictions
+
+Let's verify the model produces reasonable aesthetic scores.
+
+
+```python
+# runs in jupyter container on node-serve-model
+with torch.no_grad():
+    images, _ = next(iter(test_loader))
+    image_features = clip_model.encode_image(images.to(device))
+    embeddings = torch.from_numpy(normalized(image_features.cpu().numpy())).float().to(device)
+    scores = model(embeddings).squeeze()
+    mean_score = scores.mean().item()
+    std_score = scores.std().item()
+```
+
+```python
+# runs in jupyter container on node-serve-model
+print("Sample predicted aesthetic scores (0-10):")
+for i in range(min(5, len(scores))):
+    print(f"  Image {i+1}: {scores[i].item():.2f}")
+print(f"\nBatch mean: {mean_score:.2f}, std: {std_score:.2f}")
+```
+
+
+#### MLP inference latency (eager mode)
+
+We pre-compute a CLIP embedding, then measure only the MLP forward pass.
+
+
+```python
+# runs in jupyter container on node-serve-model
+num_trials = 100
+
+# Pre-compute a single CLIP embedding for benchmarking MLP latency
+with torch.no_grad():
+    sample_image, _ = next(iter(test_loader))
+    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    single_embedding = torch.from_numpy(normalized(sample_features.cpu().numpy())).float().to(device)
+
+# Warm-up run 
+with torch.no_grad():
+    model(single_embedding)
+
+mlp_latencies_eager = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        _ = model(single_embedding)
+        mlp_latencies_eager.append(time.time() - start_time)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+print("MLP Single Sample Latency (Eager, CPU):")
+print(f"  Median: {np.percentile(mlp_latencies_eager, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(mlp_latencies_eager, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(mlp_latencies_eager, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials/np.sum(mlp_latencies_eager):.2f} FPS")
+```
+
+
+#### MLP batch throughput (eager mode)
+
+
+```python
+# runs in jupyter container on node-serve-model
+num_batches = 50
+
+# Pre-compute a batch of CLIP embeddings for benchmarking MLP throughput
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_embeddings = torch.from_numpy(normalized(batch_features.cpu().numpy())).float().to(device)
+
+# Warm-up run 
+with torch.no_grad():
+    model(batch_embeddings)
+
+mlp_batch_times_eager = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        _ = model(batch_embeddings)
+        mlp_batch_times_eager.append(time.time() - start_time)
+
+mlp_batch_fps_eager = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_eager)
+print(f"MLP Batch Throughput (Eager, CPU, batch_size=32): {mlp_batch_fps_eager:.2f} FPS")
+```
+
+
+
+#### MLP compiled mode (CPU)
+
+
+```python
+# runs in jupyter container on node-serve-model
+model = torch.compile(model)
+
+# Warm-up (triggers compilation)
+print("Compiling MLP model (this may take a moment)...")
+with torch.no_grad():
+    model(single_embedding)
+print("Compilation complete.")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+mlp_latencies_compiled = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        _ = model(single_embedding)
+        mlp_latencies_compiled.append(time.time() - start_time)
+
+print("MLP Single Sample Latency (Compiled, CPU):")
+print(f"  Median: {np.percentile(mlp_latencies_compiled, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(mlp_latencies_compiled, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(mlp_latencies_compiled, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials/np.sum(mlp_latencies_compiled):.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+mlp_batch_times_compiled = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        _ = model(batch_embeddings)
+        mlp_batch_times_compiled.append(time.time() - start_time)
+
+mlp_batch_fps_compiled = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_compiled)
+print(f"MLP Batch Throughput (Compiled, CPU, batch_size=32): {mlp_batch_fps_compiled:.2f} FPS")
+```
+
+
+
+#### MLP CPU summary
+
+
+```python
+# runs in jupyter container on node-serve-model
+print("=" * 60)
+print("Aesthetic MLP Head CPU Benchmark Summary")
+print("=" * 60)
+print(f"MLP Model Size on Disk: {mlp_model_size / (1e6):.2f} MB")
+print(f"Mean Predicted Score: {mean_score:.2f} (std: {std_score:.2f})")
+print()
+print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
+print("-" * 60)
+print(f"{'Single sample latency (median, ms)':<45} {np.percentile(mlp_latencies_eager, 50)*1000:>8.2f} {np.percentile(mlp_latencies_compiled, 50)*1000:>8.2f}")
+print(f"{'Single sample latency (p95, ms)':<45} {np.percentile(mlp_latencies_eager, 95)*1000:>8.2f} {np.percentile(mlp_latencies_compiled, 95)*1000:>8.2f}")
+print(f"{'Single sample throughput (FPS)':<45} {num_trials/np.sum(mlp_latencies_eager):>8.2f} {num_trials/np.sum(mlp_latencies_compiled):>8.2f}")
+print(f"{'Batch throughput (FPS, batch_size=32)':<45} {mlp_batch_fps_eager:>8.2f} {mlp_batch_fps_compiled:>8.2f}")
+```
+
+
+---
+
+## Part 3: End-to-End Pipeline (CPU)
+
+Finally, let's measure the full pipeline: image → ViT → normalize → MLP → score. This shows the total latency a user would experience. We'll reload fresh (uncompiled) models.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Reload uncompiled models for E2E measurement
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+model = torch.load(model_path, map_location=device, weights_only=False)
+model.eval()
+```
+
+```python
+# runs in jupyter container on node-serve-model
+num_trials = 50
+
+# Single image E2E
+single_image = single_image[:1].to(device)
+
+# Warm-up
+with torch.no_grad():
+    feat = clip_model.encode_image(single_image)
+    emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+    model(emb)
+
+e2e_latencies = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        feat = clip_model.encode_image(single_image)
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+        _ = model(emb)
+        e2e_latencies.append(time.time() - start_time)
+
+print("End-to-End Single Image Latency (CPU):")
+print(f"  Median: {np.percentile(e2e_latencies, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(e2e_latencies, 95) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(e2e_latencies):.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Batch E2E
+batch_images, _ = next(iter(test_loader))
+batch_images = batch_images.to(device)
+
+e2e_batch_times = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        feat = clip_model.encode_image(batch_images)
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+        _ = model(emb)
+        e2e_batch_times.append(time.time() - start_time)
+
+e2e_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_batch_times)
+print(f"End-to-End Batch Throughput (CPU, batch_size=32): {e2e_batch_fps:.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Latency breakdown
+vit_median = np.percentile(vit_latencies_eager, 50) * 1000
+mlp_median = np.percentile(mlp_latencies_eager, 50) * 1000
+e2e_median = np.percentile(e2e_latencies, 50) * 1000
+
+print("=" * 50)
+print("End-to-End Latency Breakdown (CPU, single image)")
+print("=" * 50)
+print(f"  ViT encode:    {vit_median:.2f} ms ({vit_median/e2e_median*100:.1f}%)")
+print(f"  MLP forward:   {mlp_median:.2f} ms ({mlp_median/e2e_median*100:.1f}%)")
+print(f"  E2E total:     {e2e_median:.2f} ms")
+print()
+print("The ViT encoder dominates the pipeline cost.")
+print("Optimizing the MLP (ONNX, quantization, etc.) will")
+print("improve MLP latency, but the total pipeline speedup")
+print("depends primarily on the ViT encoder performance.")
+```
 
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
-
-
-
-
-### Eager mode execution vs compiled model
-
-We had just evaluated a model in eager mode. However, in some (although, not all) cases we may get better performance from compiling the model into a graph, and executing it as a graph.
-
-Go back to the cell where the model is loaded, and add
-
-```python
-model.compile()
-```
-
-just below the call to `torch.load`. Then, run the notebook again ("Run > Run All Cells"). 
-
-When you are done, download the fully executed notebook **again** from the Jupyter container environment for later reference.
-
 
 
 
@@ -633,21 +832,28 @@ import numpy as np
 import torch
 import onnx
 import onnxruntime as ort
-from torchvision import datasets, transforms
+from torchvision import datasets
 from torch.utils.data import DataLoader
+import clip
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-# Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+# Load CLIP model for computing image embeddings
+device = torch.device("cpu")
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Prepare test dataset using CLIP's preprocessing
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 
@@ -659,13 +865,13 @@ First, let's load our saved PyTorch model, and convert it to ONNX using PyTorch'
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/food11.pth"  
+model_path = "models/aesthetic_mlp.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 
-onnx_model_path = "models/food11.onnx"
-# dummy input - used to clarify the input shape
-dummy_input = torch.randn(1, 3, 224, 224)  
+onnx_model_path = "models/aesthetic_mlp.onnx"
+# MLP expects a 768-dim CLIP embedding as input
+dummy_input = torch.randn(1, 768)
 torch.onnx.export(model, dummy_input, onnx_model_path,
                   export_params=True, opset_version=20,
                   do_constant_folding=True, input_names=['input'],
@@ -690,7 +896,7 @@ For this first ONNX baseline, we will explicitly disable graph optimizations, so
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ```
 
 ```python
@@ -721,28 +927,30 @@ ort_session.get_providers()
 
 
 
-#### Test accuracy
+#### Sample predictions
 
 
-First, let's measure accuracy on the test set:
+First, let's verify the model produces reasonable aesthetic scores:
 
 
 ```python
 # runs in jupyter container on node-serve-model
-correct = 0
-total = 0
-for images, labels in test_loader:
-    images_np = images.numpy()
-    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: images_np})[0]
-    predicted = np.argmax(outputs, axis=1)
-    total += labels.size(0)
-    correct += (predicted == labels.numpy()).sum()
-accuracy = (correct / total) * 100
+with torch.no_grad():
+    images, _ = next(iter(test_loader))
+    image_features = clip_model.encode_image(images.to(device))
+    embeddings = normalized(image_features.cpu().numpy()).astype(np.float32)
+    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: embeddings})[0]
+    scores = outputs.flatten()
+    mean_score = scores.mean()
+    std_score = scores.std()
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
+print("Sample predicted aesthetic scores (0-10):")
+for i in range(min(5, len(scores))):
+    print(f"  Image {i+1}: {scores[i]:.2f}")
+print(f"\nBatch mean: {mean_score:.2f}, std: {std_score:.2f}")
 ```
 
 
@@ -770,18 +978,19 @@ Now, we'll measure how long it takes the model to return a prediction for a sing
 # runs in jupyter container on node-serve-model
 num_trials = 100  # Number of trials
 
-# Get a single sample from the test data
-
-single_sample, _ = next(iter(test_loader))  
-single_sample = single_sample[:1].numpy()
+# Pre-compute a single CLIP embedding for benchmarking
+with torch.no_grad():
+    sample_image, _ = next(iter(test_loader))
+    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    single_embedding = normalized(sample_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
-ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
 
 latencies = []
 for _ in range(num_trials):
     start_time = time.time()
-    ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
     latencies.append(time.time() - start_time)
 ```
 
@@ -805,23 +1014,25 @@ Finally, we'll measure the rate at which the model can return predictions for ba
 # runs in jupyter container on node-serve-model
 num_batches = 50  # Number of trials
 
-# Get a batch from the test data
-batch_input, _ = next(iter(test_loader))  
-batch_input = batch_input.numpy()
+# Pre-compute a batch of CLIP embeddings for benchmarking
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
-ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
 
 batch_times = []
 for _ in range(num_batches):
     start_time = time.time()
-    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
     batch_times.append(time.time() - start_time)
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-batch_fps = (batch_input.shape[0] * num_batches) / np.sum(batch_times) 
+batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
 print(f"Batch Throughput: {batch_fps:.2f} FPS")
 ```
 
@@ -833,7 +1044,7 @@ print(f"Batch Throughput: {batch_fps:.2f} FPS")
 
 ```python
 # runs in jupyter container on node-serve-model
-print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
+print(f"Mean Predicted Score: {mean_score:.2f} (std: {std_score:.2f})")
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
 print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
@@ -842,7 +1053,7 @@ print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f}
 print(f"Batch Throughput: {batch_fps:.2f} FPS")
 ```
 
-<!-- summary for mobilenet
+<!-- summary for aesthetic_mlp
 
 Model Size on Disk: 8.92 MB
 Accuracy: 90.59% (3032/3347 correct)
@@ -873,7 +1084,7 @@ Batch Throughput: 1103.28 FPS
 -->
 
 
-<!-- summary for mobilenet with graph optimization
+<!-- summary for aesthetic_mlp with graph optimization
 
 Model Size on Disk: 8.91 MB
 Accuracy: 90.59% (3032/3347 correct)
@@ -924,7 +1135,7 @@ Batch Throughput: 2519.80 FPS
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
-Also download the `food11.onnx` model from inside the `models` directory.
+Also download the `aesthetic_mlp.onnx` model from inside the `models` directory.
 
 
 
@@ -956,22 +1167,41 @@ import numpy as np
 import torch
 import onnx
 import onnxruntime as ort
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
+from torchvision import datasets
+from torch.utils.data import DataLoader, TensorDataset
+import clip
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-# Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+# Load CLIP model for computing image embeddings
+device = torch.device("cpu")
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Prepare test dataset using CLIP's preprocessing
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Pre-compute CLIP embeddings for benchmarking
+print("Pre-computing CLIP embeddings for benchmark data...")
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
+    single_embedding = batch_embeddings[:1]
+print(f"Embeddings shape: {batch_embeddings.shape}")
 ```
 
 
@@ -981,36 +1211,24 @@ def benchmark_session(ort_session):
 
     print(f"Execution provider: {ort_session.get_providers()}")
 
-    ## Benchmark accuracy
+    ## Sample predictions
 
-    correct = 0
-    total = 0
-    for images, labels in test_loader:
-        images_np = images.numpy()
-        outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: images_np})[0]
-        predicted = np.argmax(outputs, axis=1)
-        total += labels.size(0)
-        correct += (predicted == labels.numpy()).sum()
-    accuracy = (correct / total) * 100
-
-    print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
+    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
 
     ## Benchmark inference latency for single sample
 
     num_trials = 100  # Number of trials
 
-    # Get a single sample from the test data
-
-    single_sample, _ = next(iter(test_loader))  
-    single_sample = single_sample[:1].numpy()
-
     # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
 
     latencies = []
     for _ in range(num_trials):
         start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
+        ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
         latencies.append(time.time() - start_time)
 
     print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
@@ -1022,20 +1240,16 @@ def benchmark_session(ort_session):
 
     num_batches = 50  # Number of trials
 
-    # Get a batch from the test data
-    batch_input, _ = next(iter(test_loader))  
-    batch_input = batch_input.numpy()
-
     # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
 
     batch_times = []
     for _ in range(num_batches):
         start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
+        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
         batch_times.append(time.time() - start_time)
 
-    batch_fps = (batch_input.shape[0] * num_batches) / np.sum(batch_times) 
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
     print(f"Batch Throughput: {batch_fps:.2f} FPS")
 
 ```
@@ -1048,13 +1262,13 @@ def benchmark_session(ort_session):
 
 Let's start by applying some basic [graph optimizations](https://onnxruntime.ai/docs/performance/model-optimizations/graph-optimizations.html#onlineoffline-mode), e.g. fusing operations. 
 
-We will save the model after applying graph optimizations to `models/food11_optimized.onnx`, then evaluate that model in a new session.
+We will save the model after applying graph optimizations to `models/aesthetic_mlp_optimized.onnx`, then evaluate that model in a new session.
 
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
-optimized_model_path = "models/food11_optimized.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
+optimized_model_path = "models/aesthetic_mlp_optimized.onnx"
 
 session_options = ort.SessionOptions()
 session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED # apply graph optimizations
@@ -1065,10 +1279,10 @@ ort_session = ort.InferenceSession(onnx_model_path, sess_options=session_options
 
 
 
-Download the `food11_optimized.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_optimized.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `food11.onnx` and review the graph. Then, upload the `food11_optimized.onnx` and see what has changed in the "optimized" graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_optimized.onnx` and see what has changed in the "optimized" graph.
 
 
 
@@ -1079,7 +1293,7 @@ Next, evaluate the optimized model. The graph optimizations may improve the infe
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_optimized.onnx"
+onnx_model_path = "models/aesthetic_mlp_optimized.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1114,7 +1328,7 @@ Batch Throughput: 2488.54 FPS
 
 We will continue our quest to improve inference speed! The next optimization we will attempt is quantization.
 
-There are many frameworks that offer quantization - for our Food11 model, we could:
+There are many frameworks that offer quantization - for our aesthetic MLP model, we could:
 
 * use [PyTorch quantization](https://docs.pytorch.org/ao/stable/index.html)
 * use [ONNX quantization](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html)
@@ -1158,7 +1372,7 @@ from neural_compressor import quantization
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/food11.onnx"
+model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
 # Configure the quantizer
@@ -1173,15 +1387,15 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/food11_quantized_dynamic.onnx")
+q_model.save_model_to_file("models/aesthetic_mlp_quantized_dynamic.onnx")
 ```
 
 
 
-Download the `food11_quantized_dynamic.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_quantized_dynamic.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `food11.onnx` and review the graph. Then, upload the `food11_quantized_dynamic.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_quantized_dynamic.onnx` and see what has changed in the quantized graph.
 
 Note that some of our operations have become integer operations, but we have added additional operations to quantize and dequantize activations throughout the graph. 
 
@@ -1192,7 +1406,7 @@ We are also concerned with the size of the quantized model on disk:
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_dynamic.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_dynamic.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -1206,7 +1420,7 @@ Next, evaluate the quantized model. Since we are saving weights in integer form,
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_dynamic.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_dynamic.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1243,34 +1457,39 @@ Inference Throughput (single sample): 35.28 FPS
 
 Next, we will try static quantization with a calibration dataset. 
 
-First, let's prepare the calibration dataset. This dataset will also be used to evaluate the quantized model, to see if it meets the accuracy criterion we will set.
+First, let's prepare the calibration dataset by pre-computing CLIP embeddings from the validation images. Since the ONNX model expects 768-dim embedding inputs, our calibration data must be in the same format.
 
 
 ```python
 # runs in jupyter container on node-serve-model
 import neural_compressor
 from neural_compressor import quantization
-from torchvision import datasets, transforms
 ```
-
 
 ```python
 # runs in jupyter container on node-serve-model
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+# Pre-compute CLIP embeddings for calibration/evaluation
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'validation'), transform=clip_preprocess)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=False, num_workers=4)
 
-# Load dataset
-val_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'validation'), transform=val_test_transform)
-eval_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=val_dataset)
+print("Pre-computing CLIP embeddings for calibration data...")
+cal_embeddings = []
+with torch.no_grad():
+    for images, _ in val_loader:
+        features = clip_model.encode_image(images.to(device))
+        embs = normalized(features.cpu().numpy()).astype(np.float32)
+        cal_embeddings.append(embs)
+cal_embeddings = np.vstack(cal_embeddings)
+print(f"Calibration embeddings shape: {cal_embeddings.shape}")
+
+# Wrap embeddings in a dataset for INC
+cal_dataset = TensorDataset(torch.from_numpy(cal_embeddings), torch.zeros(len(cal_embeddings)))
+cal_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=cal_dataset)
 ```
 
 
-Then, we'll configure the quantizer. We'll start with a more aggressive quantization strategy - we will prefer to quantize as much as possible, as long as the accuracy of the quantized model is not more than **0.05** less than the accuracy of the original FP32 model.
+Then, we'll configure the quantizer. We'll start with a more aggressive quantization strategy, quantizing as much as possible.
 
 
 
@@ -1278,15 +1497,11 @@ Then, we'll configure the quantizer. We'll start with a more aggressive quantiza
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/food11.onnx"
+model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
-# Configure the quantizer
+# Configure the quantizer - aggressive static quantization
 config_ptq = neural_compressor.PostTrainingQuantConfig(
-    accuracy_criterion = neural_compressor.config.AccuracyCriterion(
-        criterion="absolute",  
-        tolerable_loss=0.05  # We will tolerate up to 0.05 less accuracy in the quantized model
-    ),
     approach="static", 
     device='cpu', 
     quant_level=1,
@@ -1295,24 +1510,22 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
     calibration_sampling_size=128
 )
 
-# Find the best quantized model meeting the accuracy criterion
+# Fit the quantized model using calibration data
 q_model = quantization.fit(
     model=fp32_model, 
     conf=config_ptq, 
-    calib_dataloader=eval_dataloader,
-    eval_dataloader=eval_dataloader, 
-    eval_metric=neural_compressor.metric.Metric(name='topk')
+    calib_dataloader=cal_dataloader
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/food11_quantized_aggressive.onnx")
+q_model.save_model_to_file("models/aesthetic_mlp_quantized_aggressive.onnx")
 ```
 
 
-Download the `food11_quantized_aggressive.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_quantized_aggressive.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `food11.onnx` and review the graph. Then, upload the `food11_quantized_aggressive.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_quantized_aggressive.onnx` and see what has changed in the quantized graph.
 
 Note that within the parameters for each quantized operation, we now have a "scale" and "zero point" - these are used to convert the FP32 values to INT8 values, as described above. The optimal scale and zero point for weights is determined by the fitted weights themselves, but the calibration dataset was required to find the optimal scale and zero point for activations.
 
@@ -1325,7 +1538,7 @@ Let's get the size of the quantized model on disk:
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_aggressive.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_aggressive.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -1338,7 +1551,7 @@ Next, evaluate the quantized model.
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_aggressive.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_aggressive.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1379,24 +1592,18 @@ Batch Throughput: 2057.18 FPS
 -->
 
 
-Let's try a more conservative approach to static quantization next - we'll allow an accuracy loss only up to **0.01**. 
-
-This time, we will see that the quantizer tries a few different "recipes" - in many of them, only some of the operations are quantized, in order to try and reach the target accuracy. After each tuning attempt, it tests the quantized model on the evaluation dataset, to see if it meets the accuracy criterion; if not, it tries again.
+Let's try a more conservative approach to static quantization next, with a lower quantization level. With `quant_level=0`, fewer operations are quantized, which typically preserves more of the original model's output fidelity at the cost of less compression.
 
 
 
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/food11.onnx"
+model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
-# Configure the quantizer
+# Configure the quantizer - conservative static quantization
 config_ptq = neural_compressor.PostTrainingQuantConfig(
-    accuracy_criterion = neural_compressor.config.AccuracyCriterion(
-        criterion="absolute",  
-        tolerable_loss=0.01  # We will tolerate up to 0.01 less accuracy in the quantized model
-    ),
     approach="static", 
     device='cpu', 
     quant_level=0,  # 0 is a less aggressive quantization level
@@ -1405,24 +1612,22 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
     calibration_sampling_size=128
 )
 
-# Find the best quantized model meeting the accuracy criterion
+# Fit the quantized model
 q_model = quantization.fit(
     model=fp32_model, 
     conf=config_ptq, 
-    calib_dataloader=eval_dataloader,
-    eval_dataloader=eval_dataloader, 
-    eval_metric=neural_compressor.metric.Metric(name='topk')
+    calib_dataloader=cal_dataloader
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/food11_quantized_conservative.onnx")
+q_model.save_model_to_file("models/aesthetic_mlp_quantized_conservative.onnx")
 ```
 
 
-Download the `food11_quantized_conservative.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_quantized_conservative.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the quantization, we can visualize the models using [Netron](https://netron.app/). Upload the `food11_quantized_conservative.onnx` and see what has changed in the quantized graph, relative to the "aggressive quantization" graph.
+To see the effect of the quantization, we can visualize the models using [Netron](https://netron.app/). Upload the `aesthetic_mlp_quantized_conservative.onnx` and see what has changed in the quantized graph, relative to the "aggressive quantization" graph.
 
 In this graph, since only some operations are quantized, we have a "Quantize" node before each quantized operation in the graph, and a "Dequantize" node after.
 
@@ -1436,7 +1641,7 @@ Let's get the size of the quantized model on disk:
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_conservative.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_conservative.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -1453,7 +1658,7 @@ However, these tradeoffs vary from one model to the next, and across implementat
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_conservative.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_conservative.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1505,143 +1710,17 @@ Also download the models from inside the `models` directory.
 
 
 
-### Try a different execution provider
+### GPU Inference: ViT Encoder and ONNX Execution Providers
 
-Once a model is in ONNX format, we can use it with many *execution providers*. In ONNX, an execution provider an interface that lets ONNX models run with special hardware-specific capabilities. Until now, we have been using the `CPUExecutionProvider`, but if we use hardware-specific capabilities, e.g. switch out generic implementations of graph operations for implementations that are optimized for specific hardware, we can execute exactly the same model, much faster.
+In this notebook, we will:
 
+1. Benchmark the **CLIP ViT-L/14 image encoder on GPU** (eager + compiled, across multiple batch sizes)
+2. Measure the **end-to-end pipeline on GPU** (image → ViT → MLP → score)
+3. Test the **MLP head with different ONNX execution providers** (CPU, CUDA, TensorRT, OpenVINO)
 
+Before we can use the GPU, we need to switch from the `jupyter-onnx-base` image to the `jupyter-onnx-gpu` image.
 
-
-```python
-# runs in jupyter container on node-serve-model
-import os
-import time
-import numpy as np
-import torch
-import onnx
-import onnxruntime as ort
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-```
-
-```python
-# runs in jupyter container on node-serve-model
-# Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
-val_test_transform = transforms.Compose([
-    transforms.Resize(224),
-    transforms.CenterCrop(224),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
-test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
-```
-
-
-```python
-# runs in jupyter container on node-serve-model
-def benchmark_session(ort_session):
-
-    print(f"Execution provider: {ort_session.get_providers()}")
-
-    ## Benchmark accuracy
-
-    correct = 0
-    total = 0
-    for images, labels in test_loader:
-        images_np = images.numpy()
-        outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: images_np})[0]
-        predicted = np.argmax(outputs, axis=1)
-        total += labels.size(0)
-        correct += (predicted == labels.numpy()).sum()
-    accuracy = (correct / total) * 100
-
-    print(f"Accuracy: {accuracy:.2f}% ({correct}/{total} correct)")
-
-    ## Benchmark inference latency for single sample
-
-    num_trials = 100  # Number of trials
-
-    # Get a single sample from the test data
-
-    single_sample, _ = next(iter(test_loader))  
-    single_sample = single_sample[:1].numpy()
-
-    # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
-
-    latencies = []
-    for _ in range(num_trials):
-        start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: single_sample})
-        latencies.append(time.time() - start_time)
-
-    print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
-    print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
-    print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
-    print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
-
-    ## Benchmark batch throughput
-
-    num_batches = 50  # Number of trials
-
-    # Get a batch from the test data
-    batch_input, _ = next(iter(test_loader))  
-    batch_input = batch_input.numpy()
-
-    # Warm-up run
-    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
-
-    batch_times = []
-    for _ in range(num_batches):
-        start_time = time.time()
-        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_input})
-        batch_times.append(time.time() - start_time)
-
-    batch_fps = (batch_input.shape[0] * num_batches) / np.sum(batch_times) 
-    print(f"Batch Throughput: {batch_fps:.2f} FPS")
-
-```
-
-
-
-
-
-
-#### CPU execution provider
-
-First, for reference, we'll repeat our performance test for the (unquantized model with) `CPUExecutionProvider`:
-
-
-
-
-
-```python
-# runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
-ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
-benchmark_session(ort_session)
-```
-
-<!--
-Execution provider: ['CPUExecutionProvider']
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 9.93 ms
-Inference Latency (single sample, 95th percentile): 14.20 ms
-Inference Latency (single sample, 99th percentile): 14.43 ms
-Inference Throughput (single sample): 91.10 FPS
-Batch Throughput: 1042.47 FPS
--->
-
-
-
-#### CUDA execution provider
-
-
-Before we can use CUDA and TensorRT execution providers, we need to switch from the `jupyter-onnx-base` image to the `jupyter-onnx-gpu` image.
-
-Close this Jupyter server tab - you will reopen it shortly, with a new token.
+Close the current Jupyter server tab - you will reopen it shortly, with a new token.
 
 Go back to your SSH session on "node-serve-model", and stop the current Jupyter server with:
 
@@ -1654,7 +1733,7 @@ Build the GPU image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-gpu -f serve-model-chi/docker/Dockerfile.jupyter-onnx-nvidia .
+docker build -t jupyter-onnx-gpu -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-nvidia .
 ```
 
 Then launch a new one with the GPU image:
@@ -1664,9 +1743,9 @@ Then launch a new one with the GPU image:
 docker run  -d --rm  -p 8888:8888 \
     --gpus all \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v aesthetic_data:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-gpu
 ```
@@ -1688,10 +1767,326 @@ Paste this into a browser tab, but in place of `localhost`, substitute the float
 
 Then, in the file browser on the left side, open the "work" directory and then click on the `8_ep_onnx.ipynb` notebook to continue.
 
-Run the three cells at the top, which `import` libraries, set up the data loaders, and define the `benchmark_session` function. Then continue with CUDA and TensorRT:
 
 
-Next, we'll try it with the CUDA execution provider, which will execute the model on the GPU:
+
+```python
+# runs in jupyter container on node-serve-model
+import os
+import time
+import numpy as np
+import torch
+import onnx
+import onnxruntime as ort
+from torchvision import datasets
+from torch.utils.data import DataLoader
+import clip
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Load CLIP model on GPU
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+if device.type == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / (1024**3):.1f} GB")
+
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+def normalized(a, axis=-1, order=2):
+    l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
+    l2[l2 == 0] = 1
+    return a / np.expand_dims(l2, axis)
+
+# Prepare test dataset with CLIP preprocessing
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=clip_preprocess)
+```
+
+
+
+
+---
+
+## Part 1: CLIP ViT-L/14 on GPU
+
+The ViT is the heavy part of the pipeline. On GPU, we can process much larger batches efficiently. We'll benchmark across multiple batch sizes to see how throughput scales and find the point where the GPU is fully utilized.
+
+
+
+#### ViT GPU: Eager mode across batch sizes
+
+
+```python
+# runs in jupyter container on node-serve-model
+batch_sizes = [1, 8, 32, 64, 128, 256, 512]
+num_trials_single = 100
+num_batches_multi = 50
+
+vit_gpu_eager_results = {}
+
+for bs in batch_sizes:
+    loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=4)
+    images, _ = next(iter(loader))
+    images = images.to(device)
+
+    # Warm-up
+    with torch.no_grad():
+        clip_model.encode_image(images)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    trials = num_trials_single if bs == 1 else num_batches_multi
+    latencies = []
+    with torch.no_grad():
+        for _ in range(trials):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            clip_model.encode_image(images)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            latencies.append(time.time() - start_time)
+
+    median_ms = np.percentile(latencies, 50) * 1000
+    p95_ms = np.percentile(latencies, 95) * 1000
+    fps = (bs * trials) / np.sum(latencies)
+
+    vit_gpu_eager_results[bs] = {
+        'median_ms': median_ms, 'p95_ms': p95_ms, 'fps': fps, 'latencies': latencies
+    }
+    print(f"  batch_size={bs:>3}: median={median_ms:.2f} ms, p95={p95_ms:.2f} ms, throughput={fps:.1f} FPS")
+```
+
+
+
+#### ViT GPU: Compiled mode across batch sizes
+
+Now let's compile the ViT visual encoder for potential further speedup on GPU.
+
+
+```python
+# runs in jupyter container on node-serve-model
+print("Compiling ViT visual encoder for GPU...")
+clip_model.visual = torch.compile(clip_model.visual)
+
+# Warm-up with compilation (uses batch_size=32 to trigger compilation)
+loader_32 = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+warmup_images, _ = next(iter(loader_32))
+with torch.no_grad():
+    clip_model.encode_image(warmup_images.to(device))
+if device.type == "cuda":
+    torch.cuda.synchronize()
+print("Compilation complete.")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+vit_gpu_compiled_results = {}
+
+for bs in batch_sizes:
+    loader = DataLoader(test_dataset, batch_size=bs, shuffle=False, num_workers=4)
+    images, _ = next(iter(loader))
+    images = images.to(device)
+
+    # Warm-up
+    with torch.no_grad():
+        clip_model.encode_image(images)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    trials = num_trials_single if bs == 1 else num_batches_multi
+    latencies = []
+    with torch.no_grad():
+        for _ in range(trials):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            clip_model.encode_image(images)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            latencies.append(time.time() - start_time)
+
+    median_ms = np.percentile(latencies, 50) * 1000
+    p95_ms = np.percentile(latencies, 95) * 1000
+    fps = (bs * trials) / np.sum(latencies)
+
+    vit_gpu_compiled_results[bs] = {
+        'median_ms': median_ms, 'p95_ms': p95_ms, 'fps': fps, 'latencies': latencies
+    }
+    print(f"  batch_size={bs:>3}: median={median_ms:.2f} ms, p95={p95_ms:.2f} ms, throughput={fps:.1f} FPS")
+```
+
+
+#### ViT GPU summary
+
+
+```python
+# runs in jupyter container on node-serve-model
+print("=" * 75)
+print("CLIP ViT-L/14 GPU Benchmark Summary")
+print("=" * 75)
+print(f"{'Batch Size':>10} | {'Eager (ms)':>11} {'Eager FPS':>10} | {'Compiled (ms)':>14} {'Compiled FPS':>13}")
+print("-" * 75)
+for bs in batch_sizes:
+    e = vit_gpu_eager_results[bs]
+    c = vit_gpu_compiled_results[bs]
+    print(f"{bs:>10} | {e['median_ms']:>11.2f} {e['fps']:>10.1f} | {c['median_ms']:>14.2f} {c['fps']:>13.1f}")
+```
+
+
+
+---
+
+## Part 2: End-to-End Pipeline on GPU
+
+Let's measure the full pipeline on GPU: image → ViT (GPU) → normalize → MLP (CPU) → score. The MLP stays on CPU since it's tiny and the overhead of GPU kernel launch would likely dominate.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Reload uncompiled CLIP for clean E2E measurement
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+# Load MLP on CPU
+mlp_model = torch.load("models/aesthetic_mlp.pth", map_location=torch.device("cpu"), weights_only=False)
+mlp_model.eval()
+
+num_trials = 50
+
+# Single image E2E
+loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=4)
+single_image, _ = next(iter(loader))
+single_image = single_image.to(device)
+
+# Warm-up
+with torch.no_grad():
+    feat = clip_model.encode_image(single_image)
+    emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+    mlp_model(emb)
+
+e2e_latencies = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.time()
+        feat = clip_model.encode_image(single_image)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+        _ = mlp_model(emb)
+        e2e_latencies.append(time.time() - start_time)
+
+print("End-to-End Single Image (ViT on GPU, MLP on CPU):")
+print(f"  Median: {np.percentile(e2e_latencies, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(e2e_latencies, 95) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(e2e_latencies):.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Batch E2E (batch_size=32)
+loader_32 = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+batch_images, _ = next(iter(loader_32))
+batch_images = batch_images.to(device)
+
+num_batches = 50
+e2e_batch_times = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.time()
+        feat = clip_model.encode_image(batch_images)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+        _ = mlp_model(emb)
+        e2e_batch_times.append(time.time() - start_time)
+
+e2e_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_batch_times)
+print(f"End-to-End Batch (batch_size=32, ViT on GPU, MLP on CPU): {e2e_batch_fps:.2f} FPS")
+```
+
+
+
+---
+
+## Part 3: MLP ONNX Execution Providers
+
+Now we'll benchmark the MLP head using different ONNX Runtime execution providers. Since the MLP takes pre-computed 768-dim embeddings as input, we pre-compute those once and then time only the ONNX inference.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Pre-compute CLIP embeddings for MLP ONNX benchmarking
+test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
+    single_embedding = batch_embeddings[:1]
+```
+
+```python
+# runs in jupyter container on node-serve-model
+def benchmark_session(ort_session):
+
+    print(f"Execution provider: {ort_session.get_providers()}")
+
+    ## Sample predictions
+
+    outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
+
+    ## Benchmark inference latency for single sample
+
+    num_trials = 100  # Number of trials
+
+    # Warm-up run
+    ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
+
+    latencies = []
+    for _ in range(num_trials):
+        start_time = time.time()
+        ort_session.run(None, {ort_session.get_inputs()[0].name: single_embedding})
+        latencies.append(time.time() - start_time)
+
+    print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
+    print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
+
+    ## Benchmark batch throughput
+
+    num_batches = 50  # Number of trials
+
+    # Warm-up run
+    ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
+
+    batch_times = []
+    for _ in range(num_batches):
+        start_time = time.time()
+        ort_session.run(None, {ort_session.get_inputs()[0].name: batch_embeddings})
+        batch_times.append(time.time() - start_time)
+
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
+    print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+```
+
+
+
+
+
+
+#### CPU execution provider
+
+First, for reference, we'll run the MLP ONNX model with the `CPUExecutionProvider`:
 
 
 
@@ -1699,21 +2094,32 @@ Next, we'll try it with the CUDA execution provider, which will execute the mode
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
+ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
+benchmark_session(ort_session)
+```
+
+<!-- placeholder: update with real benchmark numbers -->
+
+
+
+#### CUDA execution provider
+
+Next, we'll try the CUDA execution provider, which will execute the MLP model on the GPU:
+
+
+
+
+
+```python
+# runs in jupyter container on node-serve-model
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
 ```
 
-<!--
-Execution provider: ['CUDAExecutionProvider', 'CPUExecutionProvider']
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 0.89 ms
-Inference Latency (single sample, 95th percentile): 0.90 ms
-Inference Latency (single sample, 99th percentile): 0.91 ms
-Inference Throughput (single sample): 1117.06 FPS
-Batch Throughput: 5181.99 FPS
--->
+<!-- placeholder: update with real benchmark numbers -->
 
 
 
@@ -1727,21 +2133,13 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
 ```
 
-<!--
-Execution provider: ['TensorrtExecutionProvider', 'CPUExecutionProvider']
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 0.63 ms
-Inference Latency (single sample, 95th percentile): 0.64 ms
-Inference Latency (single sample, 99th percentile): 0.70 ms
-Inference Throughput (single sample): 1572.61 FPS
-Batch Throughput: 9274.45 FPS
--->
+<!-- placeholder: update with real benchmark numbers -->
 
 
 
@@ -1763,7 +2161,7 @@ Build the OpenVINO image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-openvino -f serve-model-chi/docker/Dockerfile.jupyter-onnx-openvino .
+docker build -t jupyter-onnx-openvino -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-openvino .
 ```
 
 Then, launch a container with the OpenVINO image:
@@ -1772,9 +2170,9 @@ Then, launch a container with the OpenVINO image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v aesthetic_data:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-openvino
 ```
@@ -1798,41 +2196,19 @@ Paste this into a browser tab, but in place of `localhost`, substitute the float
 
 Then, in the file browser on the left side, open the "work" directory and then click on the `8_ep_onnx.ipynb` notebook to continue.
 
-Run the three cells at the top, which `import` libraries, set up the data loaders, and define the `benchmark_session` function. Then, skip to the OpenVINO section and run:
+Run the cells at the top, which `import` libraries, set up the data loaders, and define the `benchmark_session` function. Then, skip to the OpenVINO section and run:
 
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['OpenVINOExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
 ```
 
 
-<!--
-
-On AMD EPYC
-
-Execution provider: ['OpenVINOExecutionProvider', 'CPUExecutionProvider']
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 1.39 ms
-Inference Latency (single sample, 95th percentile): 1.89 ms
-Inference Latency (single sample, 99th percentile): 1.92 ms
-Inference Throughput (single sample): 646.63 FPS
-Batch Throughput: 1624.30 FPS
-
-On Intel
-
-Execution provider: ['OpenVINOExecutionProvider', 'CPUExecutionProvider']
-Accuracy: 90.59% (3032/3347 correct)
-Inference Latency (single sample, median): 1.55 ms
-Inference Latency (single sample, 95th percentile): 1.76 ms
-Inference Latency (single sample, 99th percentile): 1.81 ms
-Inference Throughput (single sample): 663.72 FPS
-Batch Throughput: 2453.48 FPS
-
--->
+<!-- placeholder: update with real benchmark numbers -->
 
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
