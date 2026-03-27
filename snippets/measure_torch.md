@@ -237,7 +237,7 @@ compute_gigaio
 -->
 
 
-<!-- summary for mobilenet model
+<!-- summary for aesthetic_mlp model
 
 Model Size on Disk: 9.23 MB
 Accuracy: 90.59% (3032/3347 correct)
@@ -259,7 +259,7 @@ Batch Throughput: 98.80 FPS
 -->
 
 
-<!-- summary for mobilenet compiled model
+<!-- summary for aesthetic_mlp compiled model
 
 Model Size on Disk: 9.23 MB
 Accuracy: 90.59% (3032/3347 correct)

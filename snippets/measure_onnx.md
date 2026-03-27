@@ -278,7 +278,7 @@ print(f"Batch Throughput: {batch_fps:.2f} FPS")
 ```
 :::
 
-<!-- summary for mobilenet
+<!-- summary for aesthetic_mlp
 
 Model Size on Disk: 8.92 MB
 Accuracy: 90.59% (3032/3347 correct)
@@ -309,7 +309,7 @@ Batch Throughput: 1103.28 FPS
 -->
 
 
-<!-- summary for mobilenet with graph optimization
+<!-- summary for aesthetic_mlp with graph optimization
 
 Model Size on Disk: 8.91 MB
 Accuracy: 90.59% (3032/3347 correct)
