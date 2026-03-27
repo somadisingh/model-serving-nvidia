@@ -79,7 +79,7 @@ Since you will need the full lease time to actually execute your experiment, you
 
 At the beginning of your GPU lease time, you will continue with the next step, in which you bring up and configure a bare metal instance. To begin this step, open this experiment on Trovi:
 
-* Use this link: [Model optimizations for serving machine learning models](https://chameleoncloud.org/experiment/share/f5acccf8-f2cb-4d1e-8918-4c8fd97bfc32) on Trovi
+* Use this link: [Model Optimizations for Aesthetic Score Prediction](https://chameleoncloud.org/experiment/share/c347ab71-1a5b-41cf-a2fd-0c34d30f1e1d) on Trovi
 * Then, click "Launch on Chameleon". This will start a new Jupyter server for you, with the experiment materials already in it, including the notebook to bring up the bare metal server.
 
 Inside the `model-serving-nvidia` directory, continue with `2_create_server.ipynb`.
@@ -183,7 +183,7 @@ Now, we can use `python-chi` to execute commands on the instance, to set it up. 
 
 ```python
 # runs in Chameleon Jupyter environment
-s.execute("git clone https://github.com/somadisingh/model-serving-nvidia")
+s.execute("git clone -b deployment-pipeline https://github.com/somadisingh/model-serving-nvidia")
 ```
 
 
