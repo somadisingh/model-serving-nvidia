@@ -35,7 +35,7 @@ First, let's load our saved model in evaluation mode. Note that for now, we will
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/food11.pth"  
+model_path = "models/aesthetic_mlp.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 model.eval()  
@@ -51,14 +51,14 @@ and also prepare our test dataset:
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 :::
@@ -80,7 +80,7 @@ We will measure:
 
 #### Model size
 
-We'll start with model size. Our default `food11.pth` is a finetuned MobileNetV2, which is a small model designed for deployment on edge devices, so it is fairly small.
+We'll start with model size. Our `aesthetic_mlp.pth` is a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that maps CLIP ViT-L/14 embeddings to aesthetic scores, so it is very small.
 :::
 
 ::: {.cell .code}

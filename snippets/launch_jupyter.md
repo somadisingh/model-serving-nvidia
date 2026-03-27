@@ -18,8 +18,8 @@ Then, launch a container from the `jupyter-onnx-base` image:
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
     -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v aesthetic_data:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-base
 ```

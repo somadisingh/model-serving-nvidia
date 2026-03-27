@@ -26,7 +26,7 @@ Now that you have trained a model, you are preparing to serve predictions using 
 * inference on a server-grade GPU (NVIDIA A30 or A100). Since GourmetGram won't be able to afford to load balance across several GPUs, your manager said that the GPU option must have strong enough performance to handle the workload with a single GPU node: they are looking for less than 1ms median inference latency for a single input sample, and a batch throughput of at least 5000 frames per second.
 * inference on end-user devices, as part of an app. For this option, the model itself should be less than 5MB on disk, because users are sensitive to storage space on mobile devices. Because the total prediction time will not include any network delay when the model is on the end-user device, the "budget" for inference time is larger: your manager wants less than 15ms median inference latency for a single input sample on a low-resource edge device (ARM Cortex A76 processor).
 
-You're already off to a good start, by using a MobileNetV2 as your foundation model; this is a small model that is especially designed for fast inference time. Now you need to measure the inference performance of the model and, if it doesn't meet the requirements above, investigate ways to improve it.
+You're already off to a good start, by using a a lightweight MLP head on top of CLIP ViT-L/14 embeddings; the MLP is a small model that is especially well-suited for fast inference time. Now you need to measure the inference performance of the model and, if it doesn't meet the requirements above, investigate ways to improve it.
 
 
 
@@ -240,7 +240,7 @@ where
 
 ## Prepare data
 
-For the rest of this tutorial, we'll be training models on the [Food-11 dataset](https://www.epfl.ch/labs/mmspg/downloads/food-image-datasets/). We're going to prepare a Docker volume with this dataset already prepared on it, so that the containers we create later can attach to this volume and access the data. 
+For the rest of this tutorial, we'll be training models on the [aesthetic-hub dataset](https://www.epfl.ch/labs/mmspg/downloads/food-image-datasets/). We're going to prepare a Docker volume with this dataset already prepared on it, so that the containers we create later can attach to this volume and access the data. 
 
 
 
@@ -249,7 +249,7 @@ First, create the volume:
 
 ```bash
 # runs on node-serve-model
-docker volume create food11
+docker volume create aesthetic_mlp
 ```
 
 Then, to populate it with data, run
@@ -259,7 +259,7 @@ Then, to populate it with data, run
 docker compose -f serve-model-chi/docker/docker-compose-data.yaml up -d
 ```
 
-This will run a temporary container that downloads the Food-11 dataset, organizes it in the volume, and then stops. It may take a minute or two. You can verify with 
+This will run a temporary container that downloads the aesthetic-hub dataset, organizes it in the volume, and then stops. It may take a minute or two. You can verify with 
 
 ```bash
 # runs on node-serve-model
@@ -272,7 +272,7 @@ Finally, verify that the data looks as it should. Start a shell in a temporary c
 
 ```bash
 # runs on node-mltrain
-docker run --rm -it -v food11:/mnt alpine ls -l /mnt/Food-11/
+docker run --rm -it -v aesthetic_mlp:/mnt alpine ls -l /mnt/aesthetic-hub/
 ```
 
 it should show "evaluation", "validation", and "training" subfolders.
@@ -295,8 +295,8 @@ Then, launch a container from the `jupyter-onnx-base` image:
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
     -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v aesthetic_mlp:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-base
 ```
@@ -350,7 +350,7 @@ First, let's load our saved model in evaluation mode. Note that for now, we will
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/food11.pth"  
+model_path = "models/aesthetic_mlp.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 model.eval()  
@@ -362,14 +362,14 @@ and also prepare our test dataset:
 
 ```python
 # runs in jupyter container on node-serve-model
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 
@@ -387,7 +387,7 @@ We will measure:
 
 #### Model size
 
-We'll start with model size. Our default `food11.pth` is a finetuned MobileNetV2, which is a small model designed for deployment on edge devices, so it is fairly small.
+We'll start with model size. Our `aesthetic_mlp.pth` is a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that maps CLIP ViT-L/14 embeddings to aesthetic scores, so it is very small.
 
 ```python
 # runs in jupyter container on node-serve-model
@@ -640,14 +640,14 @@ from torch.utils.data import DataLoader
 ```python
 # runs in jupyter container on node-serve-model
 # Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 
@@ -659,11 +659,11 @@ First, let's load our saved PyTorch model, and convert it to ONNX using PyTorch'
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/food11.pth"  
+model_path = "models/aesthetic_mlp.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 # dummy input - used to clarify the input shape
 dummy_input = torch.randn(1, 3, 224, 224)  
 torch.onnx.export(model, dummy_input, onnx_model_path,
@@ -690,7 +690,7 @@ For this first ONNX baseline, we will explicitly disable graph optimizations, so
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ```
 
 ```python
@@ -924,7 +924,7 @@ Batch Throughput: 2519.80 FPS
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
-Also download the `food11.onnx` model from inside the `models` directory.
+Also download the `aesthetic_mlp.onnx` model from inside the `models` directory.
 
 
 
@@ -963,14 +963,14 @@ from torch.utils.data import DataLoader
 ```python
 # runs in jupyter container on node-serve-model
 # Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 ```
 
@@ -1048,13 +1048,13 @@ def benchmark_session(ort_session):
 
 Let's start by applying some basic [graph optimizations](https://onnxruntime.ai/docs/performance/model-optimizations/graph-optimizations.html#onlineoffline-mode), e.g. fusing operations. 
 
-We will save the model after applying graph optimizations to `models/food11_optimized.onnx`, then evaluate that model in a new session.
+We will save the model after applying graph optimizations to `models/aesthetic_mlp_optimized.onnx`, then evaluate that model in a new session.
 
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
-optimized_model_path = "models/food11_optimized.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
+optimized_model_path = "models/aesthetic_mlp_optimized.onnx"
 
 session_options = ort.SessionOptions()
 session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED # apply graph optimizations
@@ -1065,10 +1065,10 @@ ort_session = ort.InferenceSession(onnx_model_path, sess_options=session_options
 
 
 
-Download the `food11_optimized.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_optimized.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `food11.onnx` and review the graph. Then, upload the `food11_optimized.onnx` and see what has changed in the "optimized" graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_optimized.onnx` and see what has changed in the "optimized" graph.
 
 
 
@@ -1079,7 +1079,7 @@ Next, evaluate the optimized model. The graph optimizations may improve the infe
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_optimized.onnx"
+onnx_model_path = "models/aesthetic_mlp_optimized.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1114,7 +1114,7 @@ Batch Throughput: 2488.54 FPS
 
 We will continue our quest to improve inference speed! The next optimization we will attempt is quantization.
 
-There are many frameworks that offer quantization - for our Food11 model, we could:
+There are many frameworks that offer quantization - for our aesthetic MLP model, we could:
 
 * use [PyTorch quantization](https://docs.pytorch.org/ao/stable/index.html)
 * use [ONNX quantization](https://onnxruntime.ai/docs/performance/model-optimizations/quantization.html)
@@ -1158,7 +1158,7 @@ from neural_compressor import quantization
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/food11.onnx"
+model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
 # Configure the quantizer
@@ -1173,15 +1173,15 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/food11_quantized_dynamic.onnx")
+q_model.save_model_to_file("models/aesthetic_mlp_quantized_dynamic.onnx")
 ```
 
 
 
-Download the `food11_quantized_dynamic.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_quantized_dynamic.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `food11.onnx` and review the graph. Then, upload the `food11_quantized_dynamic.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_quantized_dynamic.onnx` and see what has changed in the quantized graph.
 
 Note that some of our operations have become integer operations, but we have added additional operations to quantize and dequantize activations throughout the graph. 
 
@@ -1192,7 +1192,7 @@ We are also concerned with the size of the quantized model on disk:
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_dynamic.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_dynamic.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -1206,7 +1206,7 @@ Next, evaluate the quantized model. Since we are saving weights in integer form,
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_dynamic.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_dynamic.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1256,7 +1256,7 @@ from torchvision import datasets, transforms
 
 ```python
 # runs in jupyter container on node-serve-model
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
@@ -1265,7 +1265,7 @@ val_test_transform = transforms.Compose([
 ])
 
 # Load dataset
-val_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'validation'), transform=val_test_transform)
+val_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'validation'), transform=val_test_transform)
 eval_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=val_dataset)
 ```
 
@@ -1278,7 +1278,7 @@ Then, we'll configure the quantizer. We'll start with a more aggressive quantiza
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/food11.onnx"
+model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
 # Configure the quantizer
@@ -1305,14 +1305,14 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/food11_quantized_aggressive.onnx")
+q_model.save_model_to_file("models/aesthetic_mlp_quantized_aggressive.onnx")
 ```
 
 
-Download the `food11_quantized_aggressive.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_quantized_aggressive.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `food11.onnx` and review the graph. Then, upload the `food11_quantized_aggressive.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `aesthetic_mlp_quantized_aggressive.onnx` and see what has changed in the quantized graph.
 
 Note that within the parameters for each quantized operation, we now have a "scale" and "zero point" - these are used to convert the FP32 values to INT8 values, as described above. The optimal scale and zero point for weights is determined by the fitted weights themselves, but the calibration dataset was required to find the optimal scale and zero point for activations.
 
@@ -1325,7 +1325,7 @@ Let's get the size of the quantized model on disk:
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_aggressive.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_aggressive.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -1338,7 +1338,7 @@ Next, evaluate the quantized model.
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_aggressive.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_aggressive.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1388,7 +1388,7 @@ This time, we will see that the quantizer tries a few different "recipes" - in m
 ```python
 # runs in jupyter container on node-serve-model
 # Load ONNX model into Intel Neural Compressor
-model_path = "models/food11.onnx"
+model_path = "models/aesthetic_mlp.onnx"
 fp32_model = neural_compressor.model.onnx_model.ONNXModel(model_path)
 
 # Configure the quantizer
@@ -1415,14 +1415,14 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/food11_quantized_conservative.onnx")
+q_model.save_model_to_file("models/aesthetic_mlp_quantized_conservative.onnx")
 ```
 
 
-Download the `food11_quantized_conservative.onnx` model from inside the `models` directory. 
+Download the `aesthetic_mlp_quantized_conservative.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the quantization, we can visualize the models using [Netron](https://netron.app/). Upload the `food11_quantized_conservative.onnx` and see what has changed in the quantized graph, relative to the "aggressive quantization" graph.
+To see the effect of the quantization, we can visualize the models using [Netron](https://netron.app/). Upload the `aesthetic_mlp_quantized_conservative.onnx` and see what has changed in the quantized graph, relative to the "aggressive quantization" graph.
 
 In this graph, since only some operations are quantized, we have a "Quantize" node before each quantized operation in the graph, and a "Dequantize" node after.
 
@@ -1436,7 +1436,7 @@ Let's get the size of the quantized model on disk:
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_conservative.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_conservative.onnx"
 model_size = os.path.getsize(onnx_model_path) 
 print(f"Model Size on Disk: {model_size/ (1e6) :.2f} MB")
 ```
@@ -1453,7 +1453,7 @@ However, these tradeoffs vary from one model to the next, and across implementat
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11_quantized_conservative.onnx"
+onnx_model_path = "models/aesthetic_mlp_quantized_conservative.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1527,14 +1527,14 @@ from torch.utils.data import DataLoader
 ```python
 # runs in jupyter container on node-serve-model
 # Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 
@@ -1619,7 +1619,7 @@ First, for reference, we'll repeat our performance test for the (unquantized mod
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -1665,8 +1665,8 @@ docker run  -d --rm  -p 8888:8888 \
     --gpus all \
     --shm-size 16G \
     -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v aesthetic_mlp:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-gpu
 ```
@@ -1699,7 +1699,7 @@ Next, we'll try it with the CUDA execution provider, which will execute the mode
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
@@ -1727,7 +1727,7 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
@@ -1773,8 +1773,8 @@ Then, launch a container with the OpenVINO image:
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
     -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v aesthetic_mlp:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-openvino
 ```
@@ -1803,7 +1803,7 @@ Run the three cells at the top, which `import` libraries, set up the data loader
 
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['OpenVINOExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()

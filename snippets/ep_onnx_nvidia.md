@@ -28,14 +28,14 @@ from torch.utils.data import DataLoader
 ```python
 # runs in jupyter container on node-serve-model
 # Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 :::
@@ -126,7 +126,7 @@ First, for reference, we'll repeat our performance test for the (unquantized mod
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
 ```
@@ -174,8 +174,8 @@ docker run  -d --rm  -p 8888:8888 \
     --gpus all \
     --shm-size 16G \
     -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v aesthetic_data:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-gpu
 ```
@@ -210,7 +210,7 @@ Next, we'll try it with the CUDA execution provider, which will execute the mode
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
@@ -242,7 +242,7 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()
@@ -290,8 +290,8 @@ Then, launch a container with the OpenVINO image:
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
     -v ~/serve-model-chi/workspace:/home/jovyan/work/ \
-    -v food11:/mnt/ \
-    -e FOOD11_DATA_DIR=/mnt/Food-11 \
+    -v aesthetic_data:/mnt/ \
+    -e AESTHETIC_DATA_DIR=/mnt/aesthetic-hub \
     --name jupyter \
     jupyter-onnx-openvino
 ```
@@ -322,7 +322,7 @@ Run the three cells at the top, which `import` libraries, set up the data loader
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['OpenVINOExecutionProvider'])
 benchmark_session(ort_session)
 ort.get_device()

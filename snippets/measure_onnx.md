@@ -35,14 +35,14 @@ from torch.utils.data import DataLoader
 ```python
 # runs in jupyter container on node-serve-model
 # Prepare test dataset
-food_11_data_dir = os.getenv("FOOD11_DATA_DIR", "Food-11")
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "aesthetic-hub")
 val_test_transform = transforms.Compose([
     transforms.Resize(224),
     transforms.CenterCrop(224),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
-test_dataset = datasets.ImageFolder(root=os.path.join(food_11_data_dir, 'evaluation'), transform=val_test_transform)
+test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'test'), transform=val_test_transform)
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 :::
@@ -58,11 +58,11 @@ First, let's load our saved PyTorch model, and convert it to ONNX using PyTorch'
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/food11.pth"  
+model_path = "models/aesthetic_mlp.pth"  
 device = torch.device("cpu")
 model = torch.load(model_path, map_location=device, weights_only=False)
 
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 # dummy input - used to clarify the input shape
 dummy_input = torch.randn(1, 3, 224, 224)  
 torch.onnx.export(model, dummy_input, onnx_model_path,
@@ -93,7 +93,7 @@ For this first ONNX baseline, we will explicitly disable graph optimizations, so
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-onnx_model_path = "models/food11.onnx"
+onnx_model_path = "models/aesthetic_mlp.onnx"
 ```
 :::
 
@@ -361,6 +361,6 @@ Batch Throughput: 2519.80 FPS
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
-Also download the `food11.onnx` model from inside the `models` directory.
+Also download the `aesthetic_mlp.onnx` model from inside the `models` directory.
 
 :::
