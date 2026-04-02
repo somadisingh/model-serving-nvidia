@@ -348,6 +348,7 @@ from torch.utils.data import DataLoader
 from torchvision import datasets
 import time
 import numpy as np
+import pandas as pd
 import clip
 ```
 
@@ -726,7 +727,205 @@ print(f"{'Batch throughput (FPS, batch_size=32)':<45} {mlp_batch_fps_eager:>8.2f
 
 ---
 
-## Part 3: End-to-End Pipeline (CPU)
+## Part 3: Personalized MLP Head (CPU)
+
+The personalized model takes both a 768-dim CLIP embedding and a user index as input. It has an `nn.Embedding` table that maps each user index to a 64-dim learned vector, concatenates it with the CLIP embedding (832-dim total), and passes through the same MLP architecture. This lets the model learn per-user aesthetic preferences.
+
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Reload CLIP (uncompiled) for clean benchmarking
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+
+# Load personalized model
+personal_model_path = "models/flickr_personalized_best_inference_only.pth"
+personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model.eval()
+
+# Get valid user indices from the personalized manifest
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
+personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+seen_workers = sorted(personal_manifest.loc[personal_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
+user2idx = {u: i for i, u in enumerate(seen_workers)}
+num_users = len(user2idx)
+print(f"Personalized model: {num_users} known users, embedding table shape: {personal_model.user_embedding.weight.shape}")
+```
+
+
+#### Personalized MLP model size
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_mlp_model_size = os.path.getsize(personal_model_path)
+print(f"Personalized MLP Model Size on Disk: {personal_mlp_model_size / (1e6):.2f} MB")
+print(f"Global MLP Model Size on Disk:       {mlp_model_size / (1e6):.2f} MB")
+```
+
+
+
+#### Sample predictions
+
+Let's verify the personalized model produces reasonable scores for a few different users on the same images.
+
+
+```python
+# runs in jupyter container on node-serve-model
+with torch.no_grad():
+    images, _ = next(iter(test_loader))
+    image_features = clip_model.encode_image(images.to(device))
+    embeddings = torch.from_numpy(normalized(image_features.cpu().numpy())).float().to(device)
+
+    # Pick 3 different users and score the same batch
+    sample_user_ids = [0, num_users // 2, num_users - 1]
+    for uid in sample_user_ids:
+        user_idx = torch.full((embeddings.shape[0],), uid, dtype=torch.long, device=device)
+        scores = personal_model(embeddings, user_idx).squeeze()
+        print(f"User {uid}: mean={scores.mean().item():.3f}, std={scores.std().item():.3f}, first 3: {[f'{s:.3f}' for s in scores[:3].tolist()]}")
+```
+
+
+
+#### Personalized MLP inference latency (eager mode)
+
+We pre-compute a CLIP embedding, then measure only the personalized MLP forward pass (embedding + user index → score).
+
+
+```python
+# runs in jupyter container on node-serve-model
+num_trials = 100
+
+# Pre-compute a single CLIP embedding for benchmarking
+with torch.no_grad():
+    sample_image, _ = next(iter(test_loader))
+    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    p_single_embedding = torch.from_numpy(normalized(sample_features.cpu().numpy())).float().to(device)
+    p_single_user_idx = torch.tensor([0], dtype=torch.long, device=device)
+
+# Warm-up run
+with torch.no_grad():
+    personal_model(p_single_embedding, p_single_user_idx)
+
+personal_mlp_latencies_eager = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        _ = personal_model(p_single_embedding, p_single_user_idx)
+        personal_mlp_latencies_eager.append(time.time() - start_time)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+print("Personalized MLP Single Sample Latency (Eager, CPU):")
+print(f"  Median: {np.percentile(personal_mlp_latencies_eager, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(personal_mlp_latencies_eager, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(personal_mlp_latencies_eager, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials/np.sum(personal_mlp_latencies_eager):.2f} FPS")
+```
+
+
+
+#### Personalized MLP batch throughput (eager mode)
+
+
+```python
+# runs in jupyter container on node-serve-model
+num_batches = 50
+
+# Pre-compute batch of CLIP embeddings
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    p_batch_embeddings = torch.from_numpy(normalized(batch_features.cpu().numpy())).float().to(device)
+    p_batch_user_idx = torch.zeros(p_batch_embeddings.shape[0], dtype=torch.long, device=device)
+
+# Warm-up run
+with torch.no_grad():
+    personal_model(p_batch_embeddings, p_batch_user_idx)
+
+personal_mlp_batch_times_eager = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        _ = personal_model(p_batch_embeddings, p_batch_user_idx)
+        personal_mlp_batch_times_eager.append(time.time() - start_time)
+
+personal_mlp_batch_fps_eager = (p_batch_embeddings.shape[0] * num_batches) / np.sum(personal_mlp_batch_times_eager)
+print(f"Personalized MLP Batch Throughput (Eager, CPU, batch_size=32): {personal_mlp_batch_fps_eager:.2f} FPS")
+```
+
+
+
+#### Personalized MLP compiled mode (CPU)
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_model = torch.compile(personal_model)
+
+# Warm-up (triggers compilation)
+print("Compiling Personalized MLP model (this may take a moment)...")
+with torch.no_grad():
+    personal_model(p_single_embedding, p_single_user_idx)
+print("Compilation complete.")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+personal_mlp_latencies_compiled = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        _ = personal_model(p_single_embedding, p_single_user_idx)
+        personal_mlp_latencies_compiled.append(time.time() - start_time)
+
+print("Personalized MLP Single Sample Latency (Compiled, CPU):")
+print(f"  Median: {np.percentile(personal_mlp_latencies_compiled, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(personal_mlp_latencies_compiled, 95) * 1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(personal_mlp_latencies_compiled, 99) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials/np.sum(personal_mlp_latencies_compiled):.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+personal_mlp_batch_times_compiled = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        _ = personal_model(p_batch_embeddings, p_batch_user_idx)
+        personal_mlp_batch_times_compiled.append(time.time() - start_time)
+
+personal_mlp_batch_fps_compiled = (p_batch_embeddings.shape[0] * num_batches) / np.sum(personal_mlp_batch_times_compiled)
+print(f"Personalized MLP Batch Throughput (Compiled, CPU, batch_size=32): {personal_mlp_batch_fps_compiled:.2f} FPS")
+```
+
+
+
+#### Personalized MLP CPU summary
+
+
+```python
+# runs in jupyter container on node-serve-model
+print("=" * 65)
+print("Personalized MLP Head CPU Benchmark Summary")
+print("=" * 65)
+print(f"Personalized MLP Model Size on Disk: {personal_mlp_model_size / (1e6):.2f} MB")
+print()
+print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
+print("-" * 65)
+print(f"{'Single sample latency (median, ms)':<45} {np.percentile(personal_mlp_latencies_eager, 50)*1000:>8.2f} {np.percentile(personal_mlp_latencies_compiled, 50)*1000:>8.2f}")
+print(f"{'Single sample latency (p95, ms)':<45} {np.percentile(personal_mlp_latencies_eager, 95)*1000:>8.2f} {np.percentile(personal_mlp_latencies_compiled, 95)*1000:>8.2f}")
+print(f"{'Single sample throughput (FPS)':<45} {num_trials/np.sum(personal_mlp_latencies_eager):>8.2f} {num_trials/np.sum(personal_mlp_latencies_compiled):>8.2f}")
+print(f"{'Batch throughput (FPS, batch_size=32)':<45} {personal_mlp_batch_fps_eager:>8.2f} {personal_mlp_batch_fps_compiled:>8.2f}")
+```
+
+
+
+
+---
+
+## Part 4: End-to-End Pipeline (CPU)
 
 Finally, let's measure the full pipeline: image → ViT → normalize → MLP → score. This shows the total latency a user would experience. We'll reload fresh (uncompiled) models.
 
@@ -737,6 +936,8 @@ Finally, let's measure the full pipeline: image → ViT → normalize → MLP �
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 model = torch.load(model_path, map_location=device, weights_only=False)
 model.eval()
+personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model.eval()
 ```
 
 ```python
@@ -786,19 +987,73 @@ e2e_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_batch_times)
 print(f"End-to-End Batch Throughput (CPU, batch_size=32): {e2e_batch_fps:.2f} FPS")
 ```
 
+
+#### End-to-End: Personalized MLP (CPU)
+
+The personalized pipeline adds a user index lookup, but the ViT encode step is identical.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Single image E2E - Personalized
+p_user_idx_single = torch.tensor([0], dtype=torch.long, device=device)
+
+# Warm-up
+with torch.no_grad():
+    feat = clip_model.encode_image(single_image)
+    emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+    personal_model(emb, p_user_idx_single)
+
+e2e_personal_latencies = []
+with torch.no_grad():
+    for _ in range(num_trials):
+        start_time = time.time()
+        feat = clip_model.encode_image(single_image)
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+        _ = personal_model(emb, p_user_idx_single)
+        e2e_personal_latencies.append(time.time() - start_time)
+
+print("End-to-End Single Image Latency - Personalized (CPU):")
+print(f"  Median: {np.percentile(e2e_personal_latencies, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(e2e_personal_latencies, 95) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(e2e_personal_latencies):.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Batch E2E - Personalized
+p_user_idx_batch = torch.zeros(batch_images.shape[0], dtype=torch.long, device=device)
+
+e2e_personal_batch_times = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        start_time = time.time()
+        feat = clip_model.encode_image(batch_images)
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
+        _ = personal_model(emb, p_user_idx_batch)
+        e2e_personal_batch_times.append(time.time() - start_time)
+
+e2e_personal_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_personal_batch_times)
+print(f"End-to-End Batch Throughput - Personalized (CPU, batch_size=32): {e2e_personal_batch_fps:.2f} FPS")
+```
+
 ```python
 # runs in jupyter container on node-serve-model
 # Latency breakdown
 vit_median = np.percentile(vit_latencies_eager, 50) * 1000
 mlp_median = np.percentile(mlp_latencies_eager, 50) * 1000
+personal_mlp_median = np.percentile(personal_mlp_latencies_eager, 50) * 1000
 e2e_median = np.percentile(e2e_latencies, 50) * 1000
+e2e_personal_median = np.percentile(e2e_personal_latencies, 50) * 1000
 
-print("=" * 50)
+print("=" * 55)
 print("End-to-End Latency Breakdown (CPU, single image)")
-print("=" * 50)
-print(f"  ViT encode:    {vit_median:.2f} ms ({vit_median/e2e_median*100:.1f}%)")
-print(f"  MLP forward:   {mlp_median:.2f} ms ({mlp_median/e2e_median*100:.1f}%)")
-print(f"  E2E total:     {e2e_median:.2f} ms")
+print("=" * 55)
+print(f"  ViT encode:            {vit_median:.2f} ms ({vit_median/e2e_median*100:.1f}%)")
+print(f"  Global MLP forward:    {mlp_median:.2f} ms ({mlp_median/e2e_median*100:.1f}%)")
+print(f"  Personal MLP forward:  {personal_mlp_median:.2f} ms ({personal_mlp_median/e2e_personal_median*100:.1f}%)")
+print(f"  E2E total (global):    {e2e_median:.2f} ms")
+print(f"  E2E total (personal):  {e2e_personal_median:.2f} ms")
 print()
 print("The ViT encoder dominates the pipeline cost.")
 print("Optimizing the MLP (ONNX, quantization, etc.) will")
@@ -836,6 +1091,7 @@ import onnx
 import onnxruntime as ort
 from torchvision import datasets
 from torch.utils.data import DataLoader
+import pandas as pd
 import clip
 ```
 
@@ -1135,9 +1391,198 @@ Batch Throughput: 2519.80 FPS
 
 
 
+---
+
+## Personalized MLP: ONNX Conversion and Baseline
+
+The personalized model takes two inputs: a 768-dim CLIP embedding and a user index (integer). The user index is looked up in an `nn.Embedding` table to produce a 64-dim user vector, which is concatenated with the CLIP embedding before passing through the MLP. Let's convert it to ONNX and benchmark it.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Load personalized model and get valid user indices
+personal_model_path = "models/flickr_personalized_best_inference_only.pth"
+personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+
+data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
+personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+seen_workers = sorted(personal_manifest.loc[personal_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
+user2idx = {u: i for i, u in enumerate(seen_workers)}
+num_users = len(user2idx)
+print(f"Personalized model: {num_users} known users")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Export personalized model to ONNX with two inputs
+personal_onnx_path = "models/flickr_personalized.onnx"
+dummy_embedding = torch.randn(1, 768)
+dummy_user_idx = torch.tensor([0], dtype=torch.long)
+
+torch.onnx.export(
+    personal_model, 
+    (dummy_embedding, dummy_user_idx), 
+    personal_onnx_path,
+    export_params=True, opset_version=20,
+    do_constant_folding=True,
+    input_names=['embedding', 'user_idx'],
+    output_names=['output'],
+    dynamic_axes={
+        "embedding": {0: "batch_size"}, 
+        "user_idx": {0: "batch_size"}, 
+        "output": {0: "batch_size"}
+    }
+)
+
+print(f"Personalized ONNX model saved to {personal_onnx_path}")
+personal_onnx_model = onnx.load(personal_onnx_path)
+onnx.checker.check_model(personal_onnx_model)
+```
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Create inference session (no graph optimizations for baseline)
+personal_session_options = ort.SessionOptions()
+personal_session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+
+personal_ort_session = ort.InferenceSession(
+    personal_onnx_path,
+    sess_options=personal_session_options,
+    providers=['CPUExecutionProvider']
+)
+print(f"Inputs: {[(i.name, i.shape, i.type) for i in personal_ort_session.get_inputs()]}")
+```
+
+
+
+#### Sample predictions
+
+
+```python
+# runs in jupyter container on node-serve-model
+with torch.no_grad():
+    images, _ = next(iter(test_loader))
+    image_features = clip_model.encode_image(images.to(device))
+    p_embeddings = normalized(image_features.cpu().numpy()).astype(np.float32)
+    p_user_idx = np.zeros(p_embeddings.shape[0], dtype=np.int64)
+    
+    outputs = personal_ort_session.run(None, {
+        'embedding': p_embeddings, 
+        'user_idx': p_user_idx
+    })[0]
+    p_scores = outputs.flatten()
+    p_mean_score = p_scores.mean()
+    p_std_score = p_scores.std()
+```
+
+```python
+# runs in jupyter container on node-serve-model
+print("Sample predicted aesthetic scores (personalized, 0-1):")
+for i in range(min(5, len(p_scores))):
+    print(f"  Image {i+1}: {p_scores[i]:.2f}")
+print(f"\nBatch mean: {p_mean_score:.2f}, std: {p_std_score:.2f}")
+```
+
+
+
+#### Model size
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_model_size = os.path.getsize(personal_onnx_path) 
+print(f"Personalized Model Size on Disk: {personal_model_size / (1e6):.2f} MB")
+print(f"Global Model Size on Disk:       {model_size / (1e6):.2f} MB")
+```
+
+
+
+#### Inference latency
+
+
+```python
+# runs in jupyter container on node-serve-model
+num_trials = 100
+
+# Pre-compute a single CLIP embedding for benchmarking
+with torch.no_grad():
+    sample_image, _ = next(iter(test_loader))
+    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    p_single_embedding = normalized(sample_features.cpu().numpy()).astype(np.float32)
+    p_single_user_idx = np.array([0], dtype=np.int64)
+
+# Warm-up run
+personal_ort_session.run(None, {'embedding': p_single_embedding, 'user_idx': p_single_user_idx})
+
+p_latencies = []
+for _ in range(num_trials):
+    start_time = time.time()
+    personal_ort_session.run(None, {'embedding': p_single_embedding, 'user_idx': p_single_user_idx})
+    p_latencies.append(time.time() - start_time)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+print(f"Inference Latency (single sample, median): {np.percentile(p_latencies, 50) * 1000:.2f} ms")
+print(f"Inference Latency (single sample, 95th percentile): {np.percentile(p_latencies, 95) * 1000:.2f} ms")
+print(f"Inference Latency (single sample, 99th percentile): {np.percentile(p_latencies, 99) * 1000:.2f} ms")
+print(f"Inference Throughput (single sample): {num_trials/np.sum(p_latencies):.2f} FPS")
+```
+
+
+
+#### Batch throughput
+
+
+```python
+# runs in jupyter container on node-serve-model
+num_batches = 50
+
+# Pre-compute a batch of CLIP embeddings
+with torch.no_grad():
+    batch_images, _ = next(iter(test_loader))
+    batch_features = clip_model.encode_image(batch_images.to(device))
+    p_batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
+    p_batch_user_idx = np.zeros(p_batch_embeddings.shape[0], dtype=np.int64)
+
+# Warm-up run
+personal_ort_session.run(None, {'embedding': p_batch_embeddings, 'user_idx': p_batch_user_idx})
+
+p_batch_times = []
+for _ in range(num_batches):
+    start_time = time.time()
+    personal_ort_session.run(None, {'embedding': p_batch_embeddings, 'user_idx': p_batch_user_idx})
+    p_batch_times.append(time.time() - start_time)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+p_batch_fps = (p_batch_embeddings.shape[0] * num_batches) / np.sum(p_batch_times) 
+print(f"Personalized Batch Throughput: {p_batch_fps:.2f} FPS")
+```
+
+
+
+#### Personalized ONNX summary
+
+
+```python
+# runs in jupyter container on node-serve-model
+print(f"Mean Predicted Score: {p_mean_score:.2f} (std: {p_std_score:.2f})")
+print(f"Model Size on Disk: {personal_model_size / (1e6):.2f} MB")
+print(f"Inference Latency (single sample, median): {np.percentile(p_latencies, 50) * 1000:.2f} ms")
+print(f"Inference Latency (single sample, 95th percentile): {np.percentile(p_latencies, 95) * 1000:.2f} ms")
+print(f"Inference Latency (single sample, 99th percentile): {np.percentile(p_latencies, 99) * 1000:.2f} ms")
+print(f"Inference Throughput (single sample): {num_trials/np.sum(p_latencies):.2f} FPS")
+print(f"Batch Throughput: {p_batch_fps:.2f} FPS")
+```
+
+
+
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
-Also download the `flickr_global.onnx` model from inside the `models` directory.
+Also download the `flickr_global.onnx` and `flickr_personalized.onnx` models from inside the `models` directory.
 
 
 
@@ -1171,6 +1616,7 @@ import onnx
 import onnxruntime as ort
 from torchvision import datasets
 from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
 import clip
 ```
 
@@ -1257,6 +1703,58 @@ def benchmark_session(ort_session):
 ```
 
 
+```python
+# runs in jupyter container on node-serve-model
+# Prepare personalized model data
+personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+seen_workers = sorted(personal_manifest.loc[personal_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
+num_users = len(seen_workers)
+
+p_batch_user_idx = np.zeros(batch_embeddings.shape[0], dtype=np.int64)
+p_single_user_idx = np.array([0], dtype=np.int64)
+
+def benchmark_personal_session(ort_session):
+    print(f"Execution provider: {ort_session.get_providers()}")
+
+    ## Sample predictions
+    input_names = [i.name for i in ort_session.get_inputs()]
+    outputs = ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: p_batch_user_idx})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
+
+    ## Benchmark inference latency for single sample
+    num_trials = 100
+    ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: p_single_user_idx})
+
+    latencies = []
+    for _ in range(num_trials):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: p_single_user_idx})
+        latencies.append(time.time() - start_time)
+
+    print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
+    print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
+
+    ## Benchmark batch throughput
+    num_batches = 50
+    ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: p_batch_user_idx})
+
+    batch_times = []
+    for _ in range(num_batches):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: p_batch_user_idx})
+        batch_times.append(time.time() - start_time)
+
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
+    print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+print(f"Personalized model: {num_users} known users")
+```
+
+
 
 
 
@@ -1324,6 +1822,33 @@ Inference Throughput (single sample): 214.45 FPS
 Batch Throughput: 2488.54 FPS
 
 -->
+
+
+#### Personalized MLP: Graph optimizations
+
+Apply the same graph optimizations to the personalized model.
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_onnx_path = "models/flickr_personalized.onnx"
+personal_optimized_path = "models/flickr_personalized_optimized.onnx"
+
+session_options = ort.SessionOptions()
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+session_options.optimized_model_filepath = personal_optimized_path
+
+ort_session = ort.InferenceSession(personal_onnx_path, sess_options=session_options, providers=['CPUExecutionProvider'])
+print(f"Personalized optimized model saved to {personal_optimized_path}")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+personal_optimized_path = "models/flickr_personalized_optimized.onnx"
+ort_session = ort.InferenceSession(personal_optimized_path, providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
+
 
 
 ### Apply post training quantization
@@ -1451,6 +1976,33 @@ Inference Latency (single sample, 99th percentile): 29.07 ms
 Inference Throughput (single sample): 35.28 FPS
 
 -->
+
+
+
+#### Personalized MLP: Dynamic quantization
+
+Apply dynamic quantization to the personalized model.
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
+config_ptq = neural_compressor.PostTrainingQuantConfig(approach="dynamic")
+p_q_model = quantization.fit(model=personal_fp32, conf=config_ptq)
+p_q_model.save_model_to_file("models/flickr_personalized_quantized_dynamic.onnx")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+p_dyn_size = os.path.getsize("models/flickr_personalized_quantized_dynamic.onnx")
+print(f"Personalized Quantized (Dynamic) Size on Disk: {p_dyn_size / (1e6):.2f} MB")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+ort_session = ort.InferenceSession("models/flickr_personalized_quantized_dynamic.onnx", providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
 
 
 
@@ -1705,6 +2257,93 @@ To achieve the best of both worlds - high accuracy, but the small model size and
 
 
 
+---
+
+### Personalized MLP: Static Quantization
+
+Apply the same static quantization approaches to the personalized model. We need a calibration dataloader with two inputs (embedding + user_idx).
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Prepare calibration dataloader for personalized model (two inputs)
+p_cal_user_idx = np.zeros(len(cal_embeddings), dtype=np.int64)
+p_cal_dataset = TensorDataset(
+    torch.from_numpy(cal_embeddings), 
+    torch.from_numpy(p_cal_user_idx)
+)
+p_cal_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=p_cal_dataset)
+```
+
+
+#### Personalized MLP: Aggressive static quantization
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
+
+config_ptq = neural_compressor.PostTrainingQuantConfig(
+    approach="static", device='cpu', quant_level=1,
+    quant_format="QOperator",
+    recipes={"graph_optimization_level": "ENABLE_EXTENDED"},
+    calibration_sampling_size=128
+)
+
+p_q_model = quantization.fit(
+    model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
+)
+p_q_model.save_model_to_file("models/flickr_personalized_quantized_aggressive.onnx")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+p_agg_size = os.path.getsize("models/flickr_personalized_quantized_aggressive.onnx")
+print(f"Personalized Quantized (Aggressive) Size on Disk: {p_agg_size / (1e6):.2f} MB")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+ort_session = ort.InferenceSession("models/flickr_personalized_quantized_aggressive.onnx", providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
+
+
+
+#### Personalized MLP: Conservative static quantization
+
+
+```python
+# runs in jupyter container on node-serve-model
+personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
+
+config_ptq = neural_compressor.PostTrainingQuantConfig(
+    approach="static", device='cpu', quant_level=0,
+    quant_format="QOperator",
+    recipes={"graph_optimization_level": "ENABLE_EXTENDED"},
+    calibration_sampling_size=128
+)
+
+p_q_model = quantization.fit(
+    model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
+)
+p_q_model.save_model_to_file("models/flickr_personalized_quantized_conservative.onnx")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+p_cons_size = os.path.getsize("models/flickr_personalized_quantized_conservative.onnx")
+print(f"Personalized Quantized (Conservative) Size on Disk: {p_cons_size / (1e6):.2f} MB")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+ort_session = ort.InferenceSession("models/flickr_personalized_quantized_conservative.onnx", providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
+
+
+
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
 
 Also download the models from inside the `models` directory.
@@ -1782,6 +2421,7 @@ import onnx
 import onnxruntime as ort
 from torchvision import datasets
 from torch.utils.data import DataLoader
+import pandas as pd
 import clip
 ```
 
@@ -2014,6 +2654,82 @@ print(f"End-to-End Batch (batch_size=32, ViT on GPU, MLP on CPU): {e2e_batch_fps
 
 
 
+### Personalized MLP: End-to-End Pipeline
+
+We repeat the end-to-end measurement with the **PersonalizedMLP**, which takes an additional **user index** input alongside the CLIP embedding.
+
+
+```python
+# runs in jupyter container on node-serve-model
+# Load personalized model and prepare user indices
+personal_model = torch.load("models/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+personal_model.eval()
+
+manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+seen_workers = sorted(manifest[manifest["worker_split"] == "seen_worker_pool"]["worker_id"].unique())
+user2idx = {u: i for i, u in enumerate(seen_workers)}
+print(f"Personalized model loaded. Number of seen users: {len(seen_workers)}")
+
+# Use first user for benchmarking
+sample_user_idx = torch.tensor([0], dtype=torch.long)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Personalized End-to-End single image latency
+num_trials = 50
+
+with torch.no_grad():
+    # Warm-up
+    feat = clip_model.encode_image(single_image)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+    _ = personal_model(emb, sample_user_idx)
+
+    e2e_personal_times = []
+    for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.time()
+        feat = clip_model.encode_image(single_image)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+        _ = personal_model(emb, sample_user_idx)
+        e2e_personal_times.append(time.time() - start_time)
+
+print("Personalized E2E Single Image (ViT on GPU, MLP on CPU):")
+print(f"  Median: {np.percentile(e2e_personal_times, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(e2e_personal_times, 95) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(e2e_personal_times):.2f} FPS")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Personalized End-to-End batch throughput
+batch_user_idx = torch.zeros(batch_images.shape[0], dtype=torch.long)
+num_batches = 50
+
+e2e_personal_batch_times = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.time()
+        feat = clip_model.encode_image(batch_images)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+        _ = personal_model(emb, batch_user_idx)
+        e2e_personal_batch_times.append(time.time() - start_time)
+
+e2e_personal_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_personal_batch_times)
+print(f"Personalized E2E Batch (batch_size=32, ViT on GPU, MLP on CPU): {e2e_personal_batch_fps:.2f} FPS")
+```
+
+
+
 ---
 
 ## Part 3: MLP ONNX Execution Providers
@@ -2030,6 +2746,10 @@ with torch.no_grad():
     batch_features = clip_model.encode_image(batch_images.to(device))
     batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
     single_embedding = batch_embeddings[:1]
+
+# Prepare personalized inputs for ONNX benchmarking
+user_idx_single = np.array([0], dtype=np.int64)
+user_idx_batch = np.zeros(batch_embeddings.shape[0], dtype=np.int64)
 ```
 
 ```python
@@ -2081,6 +2801,56 @@ def benchmark_session(ort_session):
 
 ```
 
+```python
+# runs in jupyter container on node-serve-model
+def benchmark_personal_session(ort_session):
+
+    input_names = [inp.name for inp in ort_session.get_inputs()]
+    print(f"Execution provider: {ort_session.get_providers()}")
+
+    ## Sample predictions
+
+    outputs = ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: user_idx_batch})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
+
+    ## Benchmark inference latency for single sample
+
+    num_trials = 100  # Number of trials
+
+    # Warm-up run
+    ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: user_idx_single})
+
+    latencies = []
+    for _ in range(num_trials):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: user_idx_single})
+        latencies.append(time.time() - start_time)
+
+    print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
+    print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
+
+    ## Benchmark batch throughput
+
+    num_batches = 50  # Number of trials
+
+    # Warm-up run
+    ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: user_idx_batch})
+
+    batch_times = []
+    for _ in range(num_batches):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: user_idx_batch})
+        batch_times.append(time.time() - start_time)
+
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
+    print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+```
+
 
 
 
@@ -2099,6 +2869,14 @@ First, for reference, we'll run the MLP ONNX model with the `CPUExecutionProvide
 onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - CPU execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
 ```
 
 <!-- placeholder: update with real benchmark numbers -->
@@ -2121,6 +2899,15 @@ benchmark_session(ort_session)
 ort.get_device()
 ```
 
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - CUDA execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['CUDAExecutionProvider'])
+benchmark_personal_session(ort_session)
+ort.get_device()
+```
+
 <!-- placeholder: update with real benchmark numbers -->
 
 
@@ -2138,6 +2925,15 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
+ort.get_device()
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - TensorRT execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['TensorrtExecutionProvider'])
+benchmark_personal_session(ort_session)
 ort.get_device()
 ```
 
@@ -2206,6 +3002,15 @@ Run the cells at the top, which `import` libraries, set up the data loaders, and
 onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['OpenVINOExecutionProvider'])
 benchmark_session(ort_session)
+ort.get_device()
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - OpenVINO execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['OpenVINOExecutionProvider'])
+benchmark_personal_session(ort_session)
 ort.get_device()
 ```
 

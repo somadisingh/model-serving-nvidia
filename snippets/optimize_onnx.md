@@ -35,6 +35,7 @@ import onnx
 import onnxruntime as ort
 from torchvision import datasets
 from torch.utils.data import DataLoader, TensorDataset
+import pandas as pd
 import clip
 ```
 :::
@@ -130,6 +131,60 @@ def benchmark_session(ort_session):
 :::
 
 
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Prepare personalized model data
+personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+seen_workers = sorted(personal_manifest.loc[personal_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
+num_users = len(seen_workers)
+
+p_batch_user_idx = np.zeros(batch_embeddings.shape[0], dtype=np.int64)
+p_single_user_idx = np.array([0], dtype=np.int64)
+
+def benchmark_personal_session(ort_session):
+    print(f"Execution provider: {ort_session.get_providers()}")
+
+    ## Sample predictions
+    input_names = [i.name for i in ort_session.get_inputs()]
+    outputs = ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: p_batch_user_idx})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
+
+    ## Benchmark inference latency for single sample
+    num_trials = 100
+    ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: p_single_user_idx})
+
+    latencies = []
+    for _ in range(num_trials):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: p_single_user_idx})
+        latencies.append(time.time() - start_time)
+
+    print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
+    print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
+
+    ## Benchmark batch throughput
+    num_batches = 50
+    ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: p_batch_user_idx})
+
+    batch_times = []
+    for _ in range(num_batches):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: p_batch_user_idx})
+        batch_times.append(time.time() - start_time)
+
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
+    print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+print(f"Personalized model: {num_users} known users")
+```
+:::
+
+
 
 
 ::: {.cell .markdown}
@@ -207,6 +262,39 @@ Inference Throughput (single sample): 214.45 FPS
 Batch Throughput: 2488.54 FPS
 
 -->
+
+::: {.cell .markdown}
+
+#### Personalized MLP: Graph optimizations
+
+Apply the same graph optimizations to the personalized model.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+personal_onnx_path = "models/flickr_personalized.onnx"
+personal_optimized_path = "models/flickr_personalized_optimized.onnx"
+
+session_options = ort.SessionOptions()
+session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+session_options.optimized_model_filepath = personal_optimized_path
+
+ort_session = ort.InferenceSession(personal_onnx_path, sess_options=session_options, providers=['CPUExecutionProvider'])
+print(f"Personalized optimized model saved to {personal_optimized_path}")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+personal_optimized_path = "models/flickr_personalized_optimized.onnx"
+ort_session = ort.InferenceSession(personal_optimized_path, providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
+:::
+
 
 ::: {.cell .markdown}
 
@@ -354,6 +442,41 @@ Inference Latency (single sample, 99th percentile): 29.07 ms
 Inference Throughput (single sample): 35.28 FPS
 
 -->
+
+
+::: {.cell .markdown}
+
+#### Personalized MLP: Dynamic quantization
+
+Apply dynamic quantization to the personalized model.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
+config_ptq = neural_compressor.PostTrainingQuantConfig(approach="dynamic")
+p_q_model = quantization.fit(model=personal_fp32, conf=config_ptq)
+p_q_model.save_model_to_file("models/flickr_personalized_quantized_dynamic.onnx")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+p_dyn_size = os.path.getsize("models/flickr_personalized_quantized_dynamic.onnx")
+print(f"Personalized Quantized (Dynamic) Size on Disk: {p_dyn_size / (1e6):.2f} MB")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+ort_session = ort.InferenceSession("models/flickr_personalized_quantized_dynamic.onnx", providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
+:::
 
 
 ::: {.cell .markdown}
@@ -641,6 +764,113 @@ To achieve the best of both worlds - high accuracy, but the small model size and
 
 -->
 
+
+
+::: {.cell .markdown}
+
+---
+
+### Personalized MLP: Static Quantization
+
+Apply the same static quantization approaches to the personalized model. We need a calibration dataloader with two inputs (embedding + user_idx).
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Prepare calibration dataloader for personalized model (two inputs)
+p_cal_user_idx = np.zeros(len(cal_embeddings), dtype=np.int64)
+p_cal_dataset = TensorDataset(
+    torch.from_numpy(cal_embeddings), 
+    torch.from_numpy(p_cal_user_idx)
+)
+p_cal_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=p_cal_dataset)
+```
+:::
+
+::: {.cell .markdown}
+
+#### Personalized MLP: Aggressive static quantization
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
+
+config_ptq = neural_compressor.PostTrainingQuantConfig(
+    approach="static", device='cpu', quant_level=1,
+    quant_format="QOperator",
+    recipes={"graph_optimization_level": "ENABLE_EXTENDED"},
+    calibration_sampling_size=128
+)
+
+p_q_model = quantization.fit(
+    model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
+)
+p_q_model.save_model_to_file("models/flickr_personalized_quantized_aggressive.onnx")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+p_agg_size = os.path.getsize("models/flickr_personalized_quantized_aggressive.onnx")
+print(f"Personalized Quantized (Aggressive) Size on Disk: {p_agg_size / (1e6):.2f} MB")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+ort_session = ort.InferenceSession("models/flickr_personalized_quantized_aggressive.onnx", providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
+:::
+
+
+::: {.cell .markdown}
+
+#### Personalized MLP: Conservative static quantization
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
+
+config_ptq = neural_compressor.PostTrainingQuantConfig(
+    approach="static", device='cpu', quant_level=0,
+    quant_format="QOperator",
+    recipes={"graph_optimization_level": "ENABLE_EXTENDED"},
+    calibration_sampling_size=128
+)
+
+p_q_model = quantization.fit(
+    model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
+)
+p_q_model.save_model_to_file("models/flickr_personalized_quantized_conservative.onnx")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+p_cons_size = os.path.getsize("models/flickr_personalized_quantized_conservative.onnx")
+print(f"Personalized Quantized (Conservative) Size on Disk: {p_cons_size / (1e6):.2f} MB")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+ort_session = ort.InferenceSession("models/flickr_personalized_quantized_conservative.onnx", providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
+```
+:::
 
 
 ::: {.cell .markdown}

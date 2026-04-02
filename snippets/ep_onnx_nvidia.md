@@ -74,6 +74,7 @@ import onnx
 import onnxruntime as ort
 from torchvision import datasets
 from torch.utils.data import DataLoader
+import pandas as pd
 import clip
 ```
 :::
@@ -332,6 +333,90 @@ print(f"End-to-End Batch (batch_size=32, ViT on GPU, MLP on CPU): {e2e_batch_fps
 
 ::: {.cell .markdown}
 
+### Personalized MLP: End-to-End Pipeline
+
+We repeat the end-to-end measurement with the **PersonalizedMLP**, which takes an additional **user index** input alongside the CLIP embedding.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Load personalized model and prepare user indices
+personal_model = torch.load("models/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+personal_model.eval()
+
+manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+seen_workers = sorted(manifest[manifest["worker_split"] == "seen_worker_pool"]["worker_id"].unique())
+user2idx = {u: i for i, u in enumerate(seen_workers)}
+print(f"Personalized model loaded. Number of seen users: {len(seen_workers)}")
+
+# Use first user for benchmarking
+sample_user_idx = torch.tensor([0], dtype=torch.long)
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Personalized End-to-End single image latency
+num_trials = 50
+
+with torch.no_grad():
+    # Warm-up
+    feat = clip_model.encode_image(single_image)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+    _ = personal_model(emb, sample_user_idx)
+
+    e2e_personal_times = []
+    for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.time()
+        feat = clip_model.encode_image(single_image)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+        _ = personal_model(emb, sample_user_idx)
+        e2e_personal_times.append(time.time() - start_time)
+
+print("Personalized E2E Single Image (ViT on GPU, MLP on CPU):")
+print(f"  Median: {np.percentile(e2e_personal_times, 50) * 1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(e2e_personal_times, 95) * 1000:.2f} ms")
+print(f"  Throughput: {num_trials / np.sum(e2e_personal_times):.2f} FPS")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Personalized End-to-End batch throughput
+batch_user_idx = torch.zeros(batch_images.shape[0], dtype=torch.long)
+num_batches = 50
+
+e2e_personal_batch_times = []
+with torch.no_grad():
+    for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        start_time = time.time()
+        feat = clip_model.encode_image(batch_images)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        emb = torch.from_numpy(normalized(feat.cpu().numpy())).float()
+        _ = personal_model(emb, batch_user_idx)
+        e2e_personal_batch_times.append(time.time() - start_time)
+
+e2e_personal_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_personal_batch_times)
+print(f"Personalized E2E Batch (batch_size=32, ViT on GPU, MLP on CPU): {e2e_personal_batch_fps:.2f} FPS")
+```
+:::
+
+
+::: {.cell .markdown}
+
 ---
 
 ## Part 3: MLP ONNX Execution Providers
@@ -350,6 +435,10 @@ with torch.no_grad():
     batch_features = clip_model.encode_image(batch_images.to(device))
     batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
     single_embedding = batch_embeddings[:1]
+
+# Prepare personalized inputs for ONNX benchmarking
+user_idx_single = np.array([0], dtype=np.int64)
+user_idx_batch = np.zeros(batch_embeddings.shape[0], dtype=np.int64)
 ```
 :::
 
@@ -404,6 +493,58 @@ def benchmark_session(ort_session):
 ```
 :::
 
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+def benchmark_personal_session(ort_session):
+
+    input_names = [inp.name for inp in ort_session.get_inputs()]
+    print(f"Execution provider: {ort_session.get_providers()}")
+
+    ## Sample predictions
+
+    outputs = ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: user_idx_batch})[0]
+    scores = outputs.flatten()
+    print(f"Sample scores (first 5): {', '.join(f'{s:.2f}' for s in scores[:5])}")
+    print(f"Mean predicted score: {scores.mean():.2f}, Std: {scores.std():.2f}")
+
+    ## Benchmark inference latency for single sample
+
+    num_trials = 100  # Number of trials
+
+    # Warm-up run
+    ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: user_idx_single})
+
+    latencies = []
+    for _ in range(num_trials):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: single_embedding, input_names[1]: user_idx_single})
+        latencies.append(time.time() - start_time)
+
+    print(f"Inference Latency (single sample, median): {np.percentile(latencies, 50) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 95th percentile): {np.percentile(latencies, 95) * 1000:.2f} ms")
+    print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
+    print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
+
+    ## Benchmark batch throughput
+
+    num_batches = 50  # Number of trials
+
+    # Warm-up run
+    ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: user_idx_batch})
+
+    batch_times = []
+    for _ in range(num_batches):
+        start_time = time.time()
+        ort_session.run(None, {input_names[0]: batch_embeddings, input_names[1]: user_idx_batch})
+        batch_times.append(time.time() - start_time)
+
+    batch_fps = (batch_embeddings.shape[0] * num_batches) / np.sum(batch_times) 
+    print(f"Batch Throughput: {batch_fps:.2f} FPS")
+
+```
+:::
+
 
 
 
@@ -425,6 +566,16 @@ First, for reference, we'll run the MLP ONNX model with the `CPUExecutionProvide
 onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CPUExecutionProvider'])
 benchmark_session(ort_session)
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - CPU execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['CPUExecutionProvider'])
+benchmark_personal_session(ort_session)
 ```
 :::
 
@@ -452,6 +603,17 @@ ort.get_device()
 ```
 :::
 
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - CUDA execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['CUDAExecutionProvider'])
+benchmark_personal_session(ort_session)
+ort.get_device()
+```
+:::
+
 <!-- placeholder: update with real benchmark numbers -->
 
 
@@ -472,6 +634,17 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
+ort.get_device()
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - TensorRT execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['TensorrtExecutionProvider'])
+benchmark_personal_session(ort_session)
 ort.get_device()
 ```
 :::
@@ -544,6 +717,17 @@ Run the cells at the top, which `import` libraries, set up the data loaders, and
 onnx_model_path = "models/flickr_global.onnx"
 ort_session = ort.InferenceSession(onnx_model_path, providers=['OpenVINOExecutionProvider'])
 benchmark_session(ort_session)
+ort.get_device()
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - OpenVINO execution provider
+personal_onnx_path = "models/flickr_personalized.onnx"
+ort_session = ort.InferenceSession(personal_onnx_path, providers=['OpenVINOExecutionProvider'])
+benchmark_personal_session(ort_session)
 ort.get_device()
 ```
 :::
