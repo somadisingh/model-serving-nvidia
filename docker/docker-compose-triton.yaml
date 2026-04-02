@@ -1,0 +1,29 @@
+name: triton_serving
+services:
+  triton_server:
+    image: nvcr.io/nvidia/tritonserver:24.10-py3
+    container_name: triton_server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"   # HTTP
+      - "8001:8001"   # gRPC
+      - "8002:8002"   # Metrics
+    volumes:
+      - /home/cc/model-serving-nvidia/models_triton:/models:ro
+    command: ["tritonserver", "--model-repository=/models"]
+
+  jupyter:
+    image: quay.io/jupyter/minimal-notebook:latest
+    container_name: jupyter_triton
+    ports:
+      - "8888:8888"
+    volumes:
+      - /home/cc/model-serving-nvidia/workspace:/home/jovyan/work
+    command: >
+      bash -c "pip install numpy tritonclient[all] && start-notebook.sh"

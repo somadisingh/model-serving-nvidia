@@ -1,0 +1,31 @@
+name: fastapi_serving
+services:
+  fastapi_server:
+    build:
+      context: /home/cc/model-serving-nvidia/fastapi_serving
+      dockerfile: Dockerfile
+    container_name: fastapi_server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "8000:8000"
+    volumes:
+      - /home/cc/model-serving-nvidia/workspace/models:/app/models:ro
+    environment:
+      - GLOBAL_ONNX_PATH=models/flickr_global.onnx
+      - PERSONAL_ONNX_PATH=models/flickr_personalized.onnx
+
+  jupyter:
+    image: quay.io/jupyter/minimal-notebook:latest
+    container_name: jupyter_fastapi
+    ports:
+      - "8888:8888"
+    volumes:
+      - /home/cc/model-serving-nvidia/workspace:/home/jovyan/work
+    command: >
+      bash -c "pip install requests numpy && start-notebook.sh"
