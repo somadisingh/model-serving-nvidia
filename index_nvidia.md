@@ -183,7 +183,7 @@ Now, we can use `python-chi` to execute commands on the instance, to set it up. 
 
 ```python
 # runs in Chameleon Jupyter environment
-s.execute("git clone -b deployment-pipeline https://github.com/somadisingh/model-serving-nvidia")
+s.execute("git clone -b main https://github.com/somadisingh/model-serving-nvidia")
 ```
 
 
@@ -3019,6 +3019,744 @@ ort.get_device()
 
 
 When you are done, download the fully executed notebook from the Jupyter container environment for later reference. (Note: because it is an executable file, and you are downloading it from a site that is not secured with HTTPS, you may have to explicitly confirm the download in some browsers.)
+
+
+# FastAPI Serving Benchmark
+
+This notebook benchmarks the aesthetic scoring MLP served via a **FastAPI + ONNX Runtime** endpoint.
+
+The FastAPI server exposes four endpoints:
+- `POST /predict/global` — single global MLP prediction
+- `POST /predict/global/batch` — batch global MLP prediction
+- `POST /predict/personalized` — single personalized MLP prediction
+- `POST /predict/personalized/batch` — batch personalized MLP prediction
+
+Each endpoint accepts **pre-computed CLIP ViT-L/14 embeddings** (768-dim float32 vectors).
+
+## Prerequisites
+
+Before running this notebook:
+
+1. Make sure you have generated the ONNX models by running notebooks 6 and 7 (at minimum `6_measure_onnx.ipynb` to produce `models/flickr_global.onnx` and `models/flickr_personalized.onnx`).
+
+2. On the Chameleon host, bring up the FastAPI containers:
+
+```bash
+# runs on node-serve-model
+docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml up -d
+```
+
+3. Get the Jupyter token:
+
+```bash
+# runs on node-serve-model
+docker exec jupyter_fastapi jupyter server list
+```
+
+4. Open this notebook in the Jupyter container at `http://<FLOATING_IP>:8888`.
+
+
+```python
+import requests
+import time
+import numpy as np
+import concurrent.futures
+```
+
+
+## Health check
+
+Verify the FastAPI server is reachable.
+
+
+```python
+FASTAPI_URL = "http://fastapi_server:8000"
+
+resp = requests.get(f"{FASTAPI_URL}/health")
+print(resp.status_code, resp.json())
+```
+
+
+## Prepare test embeddings
+
+We create random 768-dim embeddings (L2-normalized) to simulate CLIP outputs. The MLP model doesn't care about semantic content for latency benchmarking.
+
+
+```python
+# Generate a single random 768-dim embedding (normalized)
+rng = np.random.default_rng(42)
+single_emb = rng.standard_normal(768).astype(np.float32)
+single_emb = single_emb / np.linalg.norm(single_emb)
+
+# Generate a batch of 32 embeddings
+batch_emb = rng.standard_normal((32, 768)).astype(np.float32)
+batch_emb = batch_emb / np.linalg.norm(batch_emb, axis=1, keepdims=True)
+
+print(f"Single embedding shape: {single_emb.shape}")
+print(f"Batch embeddings shape: {batch_emb.shape}")
+```
+
+
+---
+
+## Part 1: Global MLP — Single Request Latency
+
+Send sequential requests one at a time and measure round-trip latency.
+
+
+```python
+url = f"{FASTAPI_URL}/predict/global"
+payload = {"embedding": single_emb.tolist()}
+
+# Quick sanity check
+resp = requests.post(url, json=payload)
+print(f"Status: {resp.status_code}, Response: {resp.json()}")
+```
+
+```python
+num_requests = 200
+latencies = []
+
+for _ in range(num_requests):
+    start = time.time()
+    resp = requests.post(url, json=payload)
+    latencies.append(time.time() - start)
+    if resp.status_code != 200:
+        print(f"Error: {resp.status_code}")
+
+latencies = np.array(latencies)
+print(f"Global MLP — Sequential Single Requests (n={num_requests})")
+print(f"  Median latency:       {np.median(latencies)*1000:.2f} ms")
+print(f"  95th percentile:      {np.percentile(latencies, 95)*1000:.2f} ms")
+print(f"  99th percentile:      {np.percentile(latencies, 99)*1000:.2f} ms")
+print(f"  Throughput:           {num_requests / latencies.sum():.2f} req/s")
+```
+
+
+## Part 2: Global MLP — Batch Request Latency
+
+Send a batch of 32 embeddings in a single request.
+
+
+```python
+batch_url = f"{FASTAPI_URL}/predict/global/batch"
+batch_payload = {"embeddings": batch_emb.tolist()}
+
+num_requests = 200
+batch_latencies = []
+
+for _ in range(num_requests):
+    start = time.time()
+    resp = requests.post(batch_url, json=batch_payload)
+    batch_latencies.append(time.time() - start)
+
+batch_latencies = np.array(batch_latencies)
+batch_throughput = (num_requests * 32) / batch_latencies.sum()
+print(f"Global MLP — Sequential Batch Requests (batch_size=32, n={num_requests})")
+print(f"  Median latency:       {np.median(batch_latencies)*1000:.2f} ms")
+print(f"  95th percentile:      {np.percentile(batch_latencies, 95)*1000:.2f} ms")
+print(f"  Throughput:           {batch_throughput:.2f} samples/s")
+```
+
+
+## Part 3: Global MLP — Concurrent Requests
+
+Simulate multiple clients sending concurrent single requests. This tests queuing behavior.
+
+
+```python
+def send_single_request(payload):
+    start = time.time()
+    resp = requests.post(f"{FASTAPI_URL}/predict/global", json=payload)
+    elapsed = time.time() - start
+    if resp.status_code == 200:
+        return elapsed
+    return None
+
+def run_concurrent_test(num_requests, payload, max_workers):
+    times = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(send_single_request, payload) for _ in range(num_requests)]
+        for f in concurrent.futures.as_completed(futures):
+            result = f.result()
+            if result is not None:
+                times.append(result)
+    return np.array(times)
+```
+
+```python
+for concurrency in [1, 4, 8, 16]:
+    num_requests = 500
+    wall_start = time.time()
+    times = run_concurrent_test(num_requests, payload, max_workers=concurrency)
+    wall_time = time.time() - wall_start
+    throughput = num_requests / wall_time
+    
+    print(f"\nConcurrency={concurrency} (n={num_requests})")
+    print(f"  Median latency:       {np.median(times)*1000:.2f} ms")
+    print(f"  95th percentile:      {np.percentile(times, 95)*1000:.2f} ms")
+    print(f"  99th percentile:      {np.percentile(times, 99)*1000:.2f} ms")
+    print(f"  Throughput:           {throughput:.2f} req/s")
+```
+
+
+---
+
+## Part 4: Personalized MLP
+
+Repeat the same measurements for the personalized model endpoint, which takes an additional `user_idx` input.
+
+
+```python
+personal_url = f"{FASTAPI_URL}/predict/personalized"
+personal_payload = {"embedding": single_emb.tolist(), "user_idx": 0}
+
+# Sanity check
+resp = requests.post(personal_url, json=personal_payload)
+print(f"Status: {resp.status_code}, Response: {resp.json()}")
+```
+
+```python
+# Sequential single request latency
+num_requests = 200
+personal_latencies = []
+
+for _ in range(num_requests):
+    start = time.time()
+    resp = requests.post(personal_url, json=personal_payload)
+    personal_latencies.append(time.time() - start)
+
+personal_latencies = np.array(personal_latencies)
+print(f"Personalized MLP — Sequential Single Requests (n={num_requests})")
+print(f"  Median latency:       {np.median(personal_latencies)*1000:.2f} ms")
+print(f"  95th percentile:      {np.percentile(personal_latencies, 95)*1000:.2f} ms")
+print(f"  99th percentile:      {np.percentile(personal_latencies, 99)*1000:.2f} ms")
+print(f"  Throughput:           {num_requests / personal_latencies.sum():.2f} req/s")
+```
+
+```python
+# Batch request
+personal_batch_url = f"{FASTAPI_URL}/predict/personalized/batch"
+personal_batch_payload = {
+    "embeddings": batch_emb.tolist(),
+    "user_indices": [0] * 32
+}
+
+num_requests = 200
+personal_batch_latencies = []
+
+for _ in range(num_requests):
+    start = time.time()
+    resp = requests.post(personal_batch_url, json=personal_batch_payload)
+    personal_batch_latencies.append(time.time() - start)
+
+personal_batch_latencies = np.array(personal_batch_latencies)
+pb_throughput = (num_requests * 32) / personal_batch_latencies.sum()
+print(f"Personalized MLP — Sequential Batch Requests (batch_size=32, n={num_requests})")
+print(f"  Median latency:       {np.median(personal_batch_latencies)*1000:.2f} ms")
+print(f"  95th percentile:      {np.percentile(personal_batch_latencies, 95)*1000:.2f} ms")
+print(f"  Throughput:           {pb_throughput:.2f} samples/s")
+```
+
+```python
+# Concurrent single requests for personalized model
+def send_personal_request(payload):
+    start = time.time()
+    resp = requests.post(f"{FASTAPI_URL}/predict/personalized", json=payload)
+    elapsed = time.time() - start
+    if resp.status_code == 200:
+        return elapsed
+    return None
+
+for concurrency in [1, 4, 8, 16]:
+    num_requests = 500
+    wall_start = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [executor.submit(send_personal_request, personal_payload) for _ in range(num_requests)]
+        times = [f.result() for f in concurrent.futures.as_completed(futures) if f.result() is not None]
+    wall_time = time.time() - wall_start
+    times = np.array(times)
+    throughput = num_requests / wall_time
+    
+    print(f"\nPersonalized Concurrency={concurrency} (n={num_requests})")
+    print(f"  Median latency:       {np.median(times)*1000:.2f} ms")
+    print(f"  95th percentile:      {np.percentile(times, 95)*1000:.2f} ms")
+    print(f"  Throughput:           {throughput:.2f} req/s")
+```
+
+
+---
+
+## Summary
+
+After running all cells above, fill in the results:
+
+
+```python
+print("FastAPI Serving Benchmark Summary")
+print("=" * 60)
+print(f"{'Scenario':<45} {'Median (ms)':>10} {'p95 (ms)':>10}")
+print("-" * 65)
+print(f"{'Global single (sequential)':<45} {np.median(latencies)*1000:>10.2f} {np.percentile(latencies, 95)*1000:>10.2f}")
+print(f"{'Global batch=32 (sequential)':<45} {np.median(batch_latencies)*1000:>10.2f} {np.percentile(batch_latencies, 95)*1000:>10.2f}")
+print(f"{'Personalized single (sequential)':<45} {np.median(personal_latencies)*1000:>10.2f} {np.percentile(personal_latencies, 95)*1000:>10.2f}")
+print(f"{'Personalized batch=32 (sequential)':<45} {np.median(personal_batch_latencies)*1000:>10.2f} {np.percentile(personal_batch_latencies, 95)*1000:>10.2f}")
+```
+
+
+When you are done, download the fully executed notebook for later reference.
+
+Then, bring down the FastAPI service:
+
+```bash
+# runs on node-serve-model
+docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml down
+```
+
+
+# Triton Inference Server Benchmark
+
+This notebook benchmarks the aesthetic scoring MLP head served via **NVIDIA Triton Inference Server** with the ONNX Runtime backend.
+
+Triton serves two models:
+- `flickr_global` — Global MLP (input: 768-dim embedding → output: aesthetic score)
+- `flickr_personalized` — Personalized MLP (inputs: embedding + user_idx → output: score)
+
+## Prerequisites
+
+Before running this notebook:
+
+1. Generate the ONNX models by running notebook 6 (`6_measure_onnx.ipynb`).
+
+2. Copy models into the Triton model repository:
+
+```bash
+# runs on node-serve-model
+cp ~/model-serving-nvidia/workspace/models/flickr_global.onnx ~/model-serving-nvidia/models_triton/flickr_global/1/model.onnx
+cp ~/model-serving-nvidia/workspace/models/flickr_personalized.onnx ~/model-serving-nvidia/models_triton/flickr_personalized/1/model.onnx
+```
+
+3. Bring up the Triton containers:
+
+```bash
+# runs on node-serve-model
+docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up -d
+```
+
+4. Verify the server is ready:
+
+```bash
+# runs on node-serve-model
+docker logs triton_server 2>&1 | tail -5
+```
+
+You should see `Started GRPCInferenceService` and `Started HTTPService`.
+
+5. Get the Jupyter token:
+
+```bash
+# runs on node-serve-model
+docker exec jupyter_triton jupyter server list
+```
+
+6. Open this notebook at `http://<FLOATING_IP>:8888`.
+
+
+```python
+import numpy as np
+import time
+import tritonclient.http as httpclient
+```
+
+
+---
+
+## Part 1: Verify Triton is ready and models are loaded
+
+
+```python
+TRITON_URL = "triton_server:8000"
+client = httpclient.InferenceServerClient(url=TRITON_URL)
+
+print(f"Server live: {client.is_server_live()}")
+print(f"Server ready: {client.is_server_ready()}")
+print()
+
+for model_name in ["flickr_global", "flickr_personalized"]:
+    ready = client.is_model_ready(model_name)
+    meta = client.get_model_metadata(model_name)
+    print(f"Model '{model_name}': ready={ready}")
+    for inp in meta['inputs']:
+        print(f"  Input:  {inp['name']:>15s}  shape={inp['shape']}  dtype={inp['datatype']}")
+    for out in meta['outputs']:
+        print(f"  Output: {out['name']:>15s}  shape={out['shape']}  dtype={out['datatype']}")
+    print()
+```
+
+
+## Prepare test data
+
+
+```python
+rng = np.random.default_rng(42)
+
+# Single sample
+single_emb = rng.standard_normal(768).astype(np.float32)
+single_emb = single_emb / np.linalg.norm(single_emb)
+single_emb = single_emb.reshape(1, 768)
+
+# Batch of 32
+batch_emb = rng.standard_normal((32, 768)).astype(np.float32)
+batch_emb = batch_emb / np.linalg.norm(batch_emb, axis=1, keepdims=True)
+
+# User indices
+single_user_idx = np.array([[0]], dtype=np.int64)
+batch_user_idx = np.zeros((32, 1), dtype=np.int64)
+
+print(f"Single embedding: {single_emb.shape}")
+print(f"Batch embeddings: {batch_emb.shape}")
+```
+
+
+---
+
+## Part 2: Global MLP — Triton Client Benchmark
+
+### Sanity check
+
+
+```python
+def infer_global(client, embeddings):
+    """Send a global model inference request."""
+    inputs = [httpclient.InferInput("input", embeddings.shape, "FP32")]
+    inputs[0].set_data_from_numpy(embeddings)
+    outputs = [httpclient.InferRequestedOutput("output")]
+    result = client.infer(model_name="flickr_global", inputs=inputs, outputs=outputs)
+    return result.as_numpy("output")
+
+# Sanity check
+scores = infer_global(client, single_emb)
+print(f"Single prediction: {scores.flatten()[0]:.4f}")
+
+scores = infer_global(client, batch_emb)
+print(f"Batch predictions (first 5): {', '.join(f'{s:.4f}' for s in scores.flatten()[:5])}")
+```
+
+
+### Sequential single-sample latency
+
+
+```python
+num_trials = 500
+latencies = []
+
+# Warm-up
+for _ in range(20):
+    infer_global(client, single_emb)
+
+for _ in range(num_trials):
+    start = time.time()
+    infer_global(client, single_emb)
+    latencies.append(time.time() - start)
+
+latencies = np.array(latencies)
+print(f"Global MLP — Triton Single Sample (n={num_trials})")
+print(f"  Median latency:       {np.median(latencies)*1000:.2f} ms")
+print(f"  95th percentile:      {np.percentile(latencies, 95)*1000:.2f} ms")
+print(f"  99th percentile:      {np.percentile(latencies, 99)*1000:.2f} ms")
+print(f"  Throughput:           {num_trials / latencies.sum():.2f} infer/s")
+```
+
+
+### Batch throughput (batch_size=32)
+
+
+```python
+num_trials = 200
+batch_latencies = []
+
+for _ in range(20):
+    infer_global(client, batch_emb)
+
+for _ in range(num_trials):
+    start = time.time()
+    infer_global(client, batch_emb)
+    batch_latencies.append(time.time() - start)
+
+batch_latencies = np.array(batch_latencies)
+throughput = (num_trials * 32) / batch_latencies.sum()
+print(f"Global MLP — Triton Batch=32 (n={num_trials})")
+print(f"  Median latency:       {np.median(batch_latencies)*1000:.2f} ms")
+print(f"  Throughput:           {throughput:.2f} samples/s")
+```
+
+
+---
+
+## Part 3: Personalized MLP — Triton Client Benchmark
+
+### Sanity check
+
+
+```python
+def infer_personalized(client, embeddings, user_indices):
+    """Send a personalized model inference request."""
+    inp_emb = httpclient.InferInput("embedding", embeddings.shape, "FP32")
+    inp_emb.set_data_from_numpy(embeddings)
+    inp_idx = httpclient.InferInput("user_idx", user_indices.shape, "INT64")
+    inp_idx.set_data_from_numpy(user_indices)
+    outputs = [httpclient.InferRequestedOutput("output")]
+    result = client.infer(model_name="flickr_personalized", inputs=[inp_emb, inp_idx], outputs=outputs)
+    return result.as_numpy("output")
+
+scores = infer_personalized(client, single_emb, single_user_idx)
+print(f"Single prediction: {scores.flatten()[0]:.4f}")
+
+scores = infer_personalized(client, batch_emb, batch_user_idx)
+print(f"Batch predictions (first 5): {', '.join(f'{s:.4f}' for s in scores.flatten()[:5])}")
+```
+
+```python
+# Sequential single-sample latency
+num_trials = 500
+personal_latencies = []
+
+for _ in range(20):
+    infer_personalized(client, single_emb, single_user_idx)
+
+for _ in range(num_trials):
+    start = time.time()
+    infer_personalized(client, single_emb, single_user_idx)
+    personal_latencies.append(time.time() - start)
+
+personal_latencies = np.array(personal_latencies)
+print(f"Personalized MLP — Triton Single Sample (n={num_trials})")
+print(f"  Median latency:       {np.median(personal_latencies)*1000:.2f} ms")
+print(f"  95th percentile:      {np.percentile(personal_latencies, 95)*1000:.2f} ms")
+print(f"  99th percentile:      {np.percentile(personal_latencies, 99)*1000:.2f} ms")
+print(f"  Throughput:           {num_trials / personal_latencies.sum():.2f} infer/s")
+```
+
+```python
+# Batch throughput (batch_size=32)
+num_trials = 200
+personal_batch_latencies = []
+
+for _ in range(20):
+    infer_personalized(client, batch_emb, batch_user_idx)
+
+for _ in range(num_trials):
+    start = time.time()
+    infer_personalized(client, batch_emb, batch_user_idx)
+    personal_batch_latencies.append(time.time() - start)
+
+personal_batch_latencies = np.array(personal_batch_latencies)
+pb_throughput = (num_trials * 32) / personal_batch_latencies.sum()
+print(f"Personalized MLP — Triton Batch=32 (n={num_trials})")
+print(f"  Median latency:       {np.median(personal_batch_latencies)*1000:.2f} ms")
+print(f"  Throughput:           {pb_throughput:.2f} samples/s")
+```
+
+
+---
+
+## Part 4: `perf_analyzer` Benchmarks
+
+Triton ships `perf_analyzer` inside its container. We can run it from the host or install it in another container. For convenience, we'll run it from the Jupyter container.
+
+Note: `perf_analyzer` generates synthetic input data matching the model's input shape.
+
+### Install perf_analyzer
+
+If `perf_analyzer` is not already available in your Jupyter container, run it from the Triton container instead:
+
+```bash
+# runs on node-serve-model
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --concurrency-range 1
+```
+
+### Concurrency sweep — Global MLP
+
+Run these commands from the **host** (or from inside the Triton container):
+
+```bash
+# Concurrency = 1 (baseline)
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 1
+
+# Concurrency = 8
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
+
+# Concurrency = 16
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 16
+```
+
+Record the **average request latency** and its breakdown:
+- `queue` — queuing delay
+- `compute infer` — actual inference time
+- `throughput` — inferences per second
+
+
+```python
+# Placeholder: paste perf_analyzer results here for reference
+# Concurrency=1:  Avg latency = ____ usec (queue=____, compute infer=____), throughput=____ infer/sec
+# Concurrency=8:  Avg latency = ____ usec (queue=____, compute infer=____), throughput=____ infer/sec
+# Concurrency=16: Avg latency = ____ usec (queue=____, compute infer=____), throughput=____ infer/sec
+```
+
+
+### Batch-size sweep
+
+Test different batch sizes with a single concurrent client:
+
+```bash
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1  --shape input:768 --concurrency-range 1
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 8  --shape input:768 --concurrency-range 1
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 16 --shape input:768 --concurrency-range 1
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 32 --shape input:768 --concurrency-range 1
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 64 --shape input:768 --concurrency-range 1
+```
+
+
+```python
+# Placeholder: paste batch-size sweep results
+# b=1:  throughput=____ infer/sec, latency=____ usec
+# b=8:  throughput=____ infer/sec, latency=____ usec
+# b=16: throughput=____ infer/sec, latency=____ usec
+# b=32: throughput=____ infer/sec, latency=____ usec
+# b=64: throughput=____ infer/sec, latency=____ usec
+```
+
+
+---
+
+## Part 5: Scaling — Multiple Model Instances
+
+By default, we configured 1 instance on GPU 0. Let's test with more instances.
+
+### Scale to 2 instances on GPU 0
+
+On the host, edit the config:
+
+```bash
+# runs on node-serve-model
+nano ~/model-serving-nvidia/models_triton/flickr_global/config.pbtxt
+```
+
+Change:
+```
+instance_group [
+  {
+    count: 1
+    kind: KIND_GPU
+    gpus: [0]
+  }
+]
+```
+to:
+```
+instance_group [
+  {
+    count: 2
+    kind: KIND_GPU
+    gpus: [0]
+  }
+]
+```
+
+Restart Triton:
+```bash
+docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up triton_server --force-recreate -d
+```
+
+Wait for it to be ready, then benchmark:
+```bash
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
+```
+
+Compare queue delay and throughput vs the single-instance case.
+
+
+```python
+# Placeholder: paste scaling results
+# 1 instance, concurrency=8:  throughput=____, queue=____ usec
+# 2 instances, concurrency=8: throughput=____, queue=____ usec
+```
+
+
+---
+
+## Part 6: Dynamic Batching
+
+Dynamic batching lets Triton combine multiple individual requests into a batch automatically, absorbing bursts without overprovisioning.
+
+### Enable dynamic batching
+
+Reset to 1 instance, then edit `config.pbtxt`:
+
+```bash
+nano ~/model-serving-nvidia/models_triton/flickr_global/config.pbtxt
+```
+
+Add at the end:
+```
+dynamic_batching {
+  preferred_batch_size: [4, 8, 16]
+  max_queue_delay_microseconds: 100
+}
+```
+
+Restart Triton, then test with Poisson arrivals at various request rates:
+
+```bash
+# Without dynamic batching (comment it out first for comparison)
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
+
+# With dynamic batching
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
+
+# Higher request rate with dynamic batching
+docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 500 --request-distribution poisson
+```
+
+Check batch statistics:
+```bash
+curl -s http://localhost:8000/v2/models/flickr_global/versions/1/stats | python3 -m json.tool
+```
+
+
+```python
+# Placeholder: paste dynamic batching results
+# Rate=200 (no batching):  avg latency=____ usec, queue=____ usec
+# Rate=200 (batching):     avg latency=____ usec, queue=____ usec
+# Rate=500 (batching):     avg latency=____ usec, queue=____ usec
+```
+
+
+---
+
+## Summary
+
+
+```python
+print("Triton Serving Benchmark Summary (Python client)")
+print("=" * 60)
+print(f"{'Scenario':<45} {'Median (ms)':>10} {'p95 (ms)':>10}")
+print("-" * 65)
+print(f"{'Global single':<45} {np.median(latencies)*1000:>10.2f} {np.percentile(latencies, 95)*1000:>10.2f}")
+print(f"{'Global batch=32':<45} {np.median(batch_latencies)*1000:>10.2f} {np.percentile(batch_latencies, 95)*1000:>10.2f}")
+print(f"{'Personalized single':<45} {np.median(personal_latencies)*1000:>10.2f} {np.percentile(personal_latencies, 95)*1000:>10.2f}")
+print(f"{'Personalized batch=32':<45} {np.median(personal_batch_latencies)*1000:>10.2f} {np.percentile(personal_batch_latencies, 95)*1000:>10.2f}")
+```
+
+
+When you are done, download the fully executed notebook for later reference.
+
+Then, bring down the Triton service:
+
+```bash
+# runs on node-serve-model
+docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml down
+```
 
 
 

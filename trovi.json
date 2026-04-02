@@ -1,6 +1,6 @@
 {
   "title": "Model Optimizations for Aesthetic Score Prediction",
-  "short_description": "Benchmark and optimize a two-stage image aesthetic scoring pipeline (CLIP ViT-L/14 + Global/Personalized MLP) on NVIDIA GPU and CPU using PyTorch, ONNX, quantization, and hardware-specific execution providers. Uses the Flickr-AES dataset.",
+  "short_description": "Benchmark and optimize a two-stage image aesthetic scoring pipeline (CLIP ViT-L/14 + Global/Personalized MLP) on NVIDIA GPU and CPU using PyTorch, ONNX, quantization, hardware-specific execution providers, FastAPI serving, and NVIDIA Triton Inference Server. Uses the Flickr-AES dataset.",
   "tags": [
     "model-serving",
     "inference-optimization",

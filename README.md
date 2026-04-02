@@ -26,6 +26,8 @@ Flickr-AES (ICCV 2017 Aesthetics Dataset) — ~40K Flickr images with crowd-sour
 3. **ONNX conversion**: Exporting the MLP heads to ONNX format.
 4. **ONNX optimization**: Graph optimizations, dynamic and static quantization on the MLP models.
 5. **Execution providers**: Testing the MLP ONNX models with CPUExecutionProvider, CUDAExecutionProvider, TensorrtExecutionProvider, and OpenVINOExecutionProvider.
+6. **FastAPI serving**: Deploying the optimized MLP heads as a REST API (FastAPI + ONNX Runtime GPU) with four endpoints (global/personalized × single/batch). Benchmarked for latency and throughput under sequential and concurrent load.
+7. **Triton Inference Server**: Serving both models via NVIDIA Triton (ONNX backend). Benchmarked with the Python `tritonclient`, `perf_analyzer` concurrency/batch sweeps, multi-instance scaling, and dynamic batching.
 
 ## Hardware
 
