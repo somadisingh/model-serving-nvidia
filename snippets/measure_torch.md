@@ -35,6 +35,77 @@ import clip
 
 ::: {.cell .markdown}
 
+## Resource monitoring
+
+The `ResourceMonitor` class polls `nvidia-smi` (GPU utilization and memory) and `psutil` (CPU and RAM) in a background thread alongside each benchmark. The results tell you how much GPU, CPU, and RAM your workload actually needs — useful for right-sizing the instance.
+
+:::
+
+::: {.cell .code}
+```python
+import subprocess
+import threading
+import psutil
+
+
+class ResourceMonitor:
+    """Polls nvidia-smi (GPU) and psutil (CPU/RAM) in a background thread."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.gpu_util = []
+        self.gpu_mem_used = []
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"], text=True
+                ).strip().split(",")
+                self.gpu_util.append(float(out[0]))
+                self.gpu_mem_used.append(float(out[1]))
+            except Exception:
+                pass  # nvidia-smi unavailable — GPU metrics skipped
+            self.cpu_percent.append(psutil.cpu_percent(interval=None))
+            self.ram_used_gb.append(psutil.virtual_memory().used / 1e9)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self.gpu_util.clear()
+        self.gpu_mem_used.clear()
+        self.cpu_percent.clear()
+        self.ram_used_gb.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def summary(self, label=""):
+        print(f"\nResource usage — {label}")
+        if self.gpu_util:
+            print(f"  GPU util:  avg={np.mean(self.gpu_util):5.1f}%  peak={max(self.gpu_util):5.1f}%")
+            print(f"  GPU mem:   avg={np.mean(self.gpu_mem_used):6.0f} MB  peak={max(self.gpu_mem_used):6.0f} MB")
+        print(f"  CPU util:  avg={np.mean(self.cpu_percent):5.1f}%  peak={max(self.cpu_percent):5.1f}%")
+        print(f"  RAM used:  avg={np.mean(self.ram_used_gb):5.2f} GB  peak={max(self.ram_used_gb):5.2f} GB")
+
+
+monitor = ResourceMonitor()
+print("ResourceMonitor ready.")
+```
+:::
+
+
+::: {.cell .markdown}
+
 First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute image embeddings). Note that for now, we will use the CPU for inference, not GPU.
 
 :::
@@ -125,6 +196,7 @@ single_image = single_image[:1].to(device)
 with torch.no_grad():
     clip_model.encode_image(single_image)
 
+monitor.start()
 vit_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -132,12 +204,14 @@ with torch.no_grad():
         clip_model.encode_image(single_image)
         latencies_i = time.time() - start_time
         vit_latencies_eager.append(latencies_i)
+monitor.stop()
 
 print("ViT-L/14 Single Image Latency (Eager, CPU):")
 print(f"  Median: {np.percentile(vit_latencies_eager, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(vit_latencies_eager, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(vit_latencies_eager, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(vit_latencies_eager):.2f} FPS")
+monitor.summary("ViT-L/14 eager single image (CPU)")
 ```
 :::
 
@@ -742,6 +816,7 @@ with torch.no_grad():
     emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
     model(emb)
 
+monitor.start()
 e2e_latencies = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -750,11 +825,13 @@ with torch.no_grad():
         emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
         _ = model(emb)
         e2e_latencies.append(time.time() - start_time)
+monitor.stop()
 
 print("End-to-End Single Image Latency (CPU):")
 print(f"  Median: {np.percentile(e2e_latencies, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(e2e_latencies, 95) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(e2e_latencies):.2f} FPS")
+monitor.summary("E2E pipeline single image (CPU)")
 ```
 :::
 

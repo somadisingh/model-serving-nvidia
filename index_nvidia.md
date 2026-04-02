@@ -354,6 +354,73 @@ import clip
 
 
 
+## Resource monitoring
+
+The `ResourceMonitor` class polls `nvidia-smi` (GPU utilization and memory) and `psutil` (CPU and RAM) in a background thread alongside each benchmark. The results tell you how much GPU, CPU, and RAM your workload actually needs — useful for right-sizing the instance.
+
+
+```python
+import subprocess
+import threading
+import psutil
+
+
+class ResourceMonitor:
+    """Polls nvidia-smi (GPU) and psutil (CPU/RAM) in a background thread."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.gpu_util = []
+        self.gpu_mem_used = []
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"], text=True
+                ).strip().split(",")
+                self.gpu_util.append(float(out[0]))
+                self.gpu_mem_used.append(float(out[1]))
+            except Exception:
+                pass  # nvidia-smi unavailable — GPU metrics skipped
+            self.cpu_percent.append(psutil.cpu_percent(interval=None))
+            self.ram_used_gb.append(psutil.virtual_memory().used / 1e9)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self.gpu_util.clear()
+        self.gpu_mem_used.clear()
+        self.cpu_percent.clear()
+        self.ram_used_gb.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def summary(self, label=""):
+        print(f"\nResource usage — {label}")
+        if self.gpu_util:
+            print(f"  GPU util:  avg={np.mean(self.gpu_util):5.1f}%  peak={max(self.gpu_util):5.1f}%")
+            print(f"  GPU mem:   avg={np.mean(self.gpu_mem_used):6.0f} MB  peak={max(self.gpu_mem_used):6.0f} MB")
+        print(f"  CPU util:  avg={np.mean(self.cpu_percent):5.1f}%  peak={max(self.cpu_percent):5.1f}%")
+        print(f"  RAM used:  avg={np.mean(self.ram_used_gb):5.2f} GB  peak={max(self.ram_used_gb):5.2f} GB")
+
+
+monitor = ResourceMonitor()
+print("ResourceMonitor ready.")
+```
+
+
+
 First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute image embeddings). Note that for now, we will use the CPU for inference, not GPU.
 
 
@@ -428,6 +495,7 @@ single_image = single_image[:1].to(device)
 with torch.no_grad():
     clip_model.encode_image(single_image)
 
+monitor.start()
 vit_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -435,12 +503,14 @@ with torch.no_grad():
         clip_model.encode_image(single_image)
         latencies_i = time.time() - start_time
         vit_latencies_eager.append(latencies_i)
+monitor.stop()
 
 print("ViT-L/14 Single Image Latency (Eager, CPU):")
 print(f"  Median: {np.percentile(vit_latencies_eager, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(vit_latencies_eager, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(vit_latencies_eager, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(vit_latencies_eager):.2f} FPS")
+monitor.summary("ViT-L/14 eager single image (CPU)")
 ```
 
 
@@ -953,6 +1023,7 @@ with torch.no_grad():
     emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
     model(emb)
 
+monitor.start()
 e2e_latencies = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -961,11 +1032,13 @@ with torch.no_grad():
         emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
         _ = model(emb)
         e2e_latencies.append(time.time() - start_time)
+monitor.stop()
 
 print("End-to-End Single Image Latency (CPU):")
 print(f"  Median: {np.percentile(e2e_latencies, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(e2e_latencies, 95) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(e2e_latencies):.2f} FPS")
+monitor.summary("E2E pipeline single image (CPU)")
 ```
 
 ```python
@@ -2425,6 +2498,72 @@ import pandas as pd
 import clip
 ```
 
+
+## Resource monitoring
+
+The `ResourceMonitor` class polls `nvidia-smi` (GPU utilization and memory) and `psutil` (CPU and RAM) in a background thread. It runs alongside each execution provider benchmark so you can see exactly how much GPU memory and compute each EP consumes — the primary signal for right-sizing.
+
+
+```python
+import subprocess
+import threading
+import psutil
+
+
+class ResourceMonitor:
+    """Polls nvidia-smi (GPU) and psutil (CPU/RAM) in a background thread."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.gpu_util = []
+        self.gpu_mem_used = []
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"], text=True
+                ).strip().split(",")
+                self.gpu_util.append(float(out[0]))
+                self.gpu_mem_used.append(float(out[1]))
+            except Exception:
+                pass  # nvidia-smi unavailable — GPU metrics skipped
+            self.cpu_percent.append(psutil.cpu_percent(interval=None))
+            self.ram_used_gb.append(psutil.virtual_memory().used / 1e9)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self.gpu_util.clear()
+        self.gpu_mem_used.clear()
+        self.cpu_percent.clear()
+        self.ram_used_gb.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def summary(self, label=""):
+        print(f"\nResource usage — {label}")
+        if self.gpu_util:
+            print(f"  GPU util:  avg={np.mean(self.gpu_util):5.1f}%  peak={max(self.gpu_util):5.1f}%")
+            print(f"  GPU mem:   avg={np.mean(self.gpu_mem_used):6.0f} MB  peak={max(self.gpu_mem_used):6.0f} MB")
+        print(f"  CPU util:  avg={np.mean(self.cpu_percent):5.1f}%  peak={max(self.cpu_percent):5.1f}%")
+        print(f"  RAM used:  avg={np.mean(self.ram_used_gb):5.2f} GB  peak={max(self.ram_used_gb):5.2f} GB")
+
+
+monitor = ResourceMonitor()
+print("ResourceMonitor ready.")
+```
+
 ```python
 # runs in jupyter container on node-serve-model
 # Load CLIP model on GPU
@@ -2894,8 +3033,11 @@ Next, we'll try the CUDA execution provider, which will execute the MLP model on
 ```python
 # runs in jupyter container on node-serve-model
 onnx_model_path = "models/flickr_global.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider'])
 benchmark_session(ort_session)
+monitor.stop()
+monitor.summary("Global MLP — CUDAExecutionProvider")
 ort.get_device()
 ```
 
@@ -2903,8 +3045,11 @@ ort.get_device()
 # runs in jupyter container on node-serve-model
 # Personalized MLP - CUDA execution provider
 personal_onnx_path = "models/flickr_personalized.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(personal_onnx_path, providers=['CUDAExecutionProvider'])
 benchmark_personal_session(ort_session)
+monitor.stop()
+monitor.summary("Personalized MLP — CUDAExecutionProvider")
 ort.get_device()
 ```
 
@@ -2923,8 +3068,11 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 ```python
 # runs in jupyter container on node-serve-model
 onnx_model_path = "models/flickr_global.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
+monitor.stop()
+monitor.summary("Global MLP — TensorrtExecutionProvider")
 ort.get_device()
 ```
 
@@ -2932,8 +3080,11 @@ ort.get_device()
 # runs in jupyter container on node-serve-model
 # Personalized MLP - TensorRT execution provider
 personal_onnx_path = "models/flickr_personalized.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(personal_onnx_path, providers=['TensorrtExecutionProvider'])
 benchmark_personal_session(ort_session)
+monitor.stop()
+monitor.summary("Personalized MLP — TensorrtExecutionProvider")
 ort.get_device()
 ```
 
@@ -3064,6 +3215,79 @@ import concurrent.futures
 ```
 
 
+## Resource monitoring
+
+The `ResourceMonitor` class polls `psutil` (CPU and RAM) in a background thread during benchmarks. Because the Jupyter container in this setup does not have direct GPU access, **server-side GPU metrics** are best observed on the host with:
+
+```bash
+# runs on node-serve-model (in a separate terminal)
+watch -n 1 nvidia-smi
+# or
+docker stats fastapi_server
+```
+
+
+```python
+import subprocess
+import threading
+import psutil
+
+
+class ResourceMonitor:
+    """Polls nvidia-smi (GPU) and psutil (CPU/RAM) in a background thread."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.gpu_util = []
+        self.gpu_mem_used = []
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"], text=True
+                ).strip().split(",")
+                self.gpu_util.append(float(out[0]))
+                self.gpu_mem_used.append(float(out[1]))
+            except Exception:
+                pass  # nvidia-smi unavailable — GPU metrics skipped
+            self.cpu_percent.append(psutil.cpu_percent(interval=None))
+            self.ram_used_gb.append(psutil.virtual_memory().used / 1e9)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self.gpu_util.clear()
+        self.gpu_mem_used.clear()
+        self.cpu_percent.clear()
+        self.ram_used_gb.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def summary(self, label=""):
+        print(f"\nResource usage — {label}")
+        if self.gpu_util:
+            print(f"  GPU util:  avg={np.mean(self.gpu_util):5.1f}%  peak={max(self.gpu_util):5.1f}%")
+            print(f"  GPU mem:   avg={np.mean(self.gpu_mem_used):6.0f} MB  peak={max(self.gpu_mem_used):6.0f} MB")
+        print(f"  CPU util:  avg={np.mean(self.cpu_percent):5.1f}%  peak={max(self.cpu_percent):5.1f}%")
+        print(f"  RAM used:  avg={np.mean(self.ram_used_gb):5.2f} GB  peak={max(self.ram_used_gb):5.2f} GB")
+
+
+monitor = ResourceMonitor()
+print("ResourceMonitor ready.")
+```
+
+
 ## Health check
 
 Verify the FastAPI server is reachable.
@@ -3187,9 +3411,11 @@ def run_concurrent_test(num_requests, payload, max_workers):
 ```python
 for concurrency in [1, 4, 8, 16]:
     num_requests = 500
+    monitor.start()
     wall_start = time.time()
     times = run_concurrent_test(num_requests, payload, max_workers=concurrency)
     wall_time = time.time() - wall_start
+    monitor.stop()
     throughput = num_requests / wall_time
     
     print(f"\nConcurrency={concurrency} (n={num_requests})")
@@ -3197,6 +3423,7 @@ for concurrency in [1, 4, 8, 16]:
     print(f"  95th percentile:      {np.percentile(times, 95)*1000:.2f} ms")
     print(f"  99th percentile:      {np.percentile(times, 99)*1000:.2f} ms")
     print(f"  Throughput:           {throughput:.2f} req/s")
+    monitor.summary(f"Global concurrent={concurrency}")
 ```
 
 
@@ -3369,6 +3596,113 @@ import tritonclient.http as httpclient
 ```
 
 
+## Resource monitoring
+
+The `ResourceMonitor` class polls `psutil` (CPU and RAM) in a background thread. Because the Jupyter container in this setup does not have direct GPU access, **server-side GPU metrics** can be pulled from Triton's built-in Prometheus metrics endpoint on port 8002, or observed on the host:
+
+```bash
+# runs on node-serve-model (in a separate terminal)
+watch -n 1 nvidia-smi
+# or
+docker stats triton_server
+```
+
+
+```python
+import subprocess
+import threading
+import psutil
+
+
+class ResourceMonitor:
+    """Polls nvidia-smi (GPU) and psutil (CPU/RAM) in a background thread."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.gpu_util = []
+        self.gpu_mem_used = []
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"], text=True
+                ).strip().split(",")
+                self.gpu_util.append(float(out[0]))
+                self.gpu_mem_used.append(float(out[1]))
+            except Exception:
+                pass  # nvidia-smi unavailable — GPU metrics skipped
+            self.cpu_percent.append(psutil.cpu_percent(interval=None))
+            self.ram_used_gb.append(psutil.virtual_memory().used / 1e9)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self.gpu_util.clear()
+        self.gpu_mem_used.clear()
+        self.cpu_percent.clear()
+        self.ram_used_gb.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def summary(self, label=""):
+        print(f"\nResource usage — {label}")
+        if self.gpu_util:
+            print(f"  GPU util:  avg={np.mean(self.gpu_util):5.1f}%  peak={max(self.gpu_util):5.1f}%")
+            print(f"  GPU mem:   avg={np.mean(self.gpu_mem_used):6.0f} MB  peak={max(self.gpu_mem_used):6.0f} MB")
+        print(f"  CPU util:  avg={np.mean(self.cpu_percent):5.1f}%  peak={max(self.cpu_percent):5.1f}%")
+        print(f"  RAM used:  avg={np.mean(self.ram_used_gb):5.2f} GB  peak={max(self.ram_used_gb):5.2f} GB")
+
+
+monitor = ResourceMonitor()
+print("ResourceMonitor ready.")
+```
+
+
+## Server-side GPU metrics via Triton
+
+Triton exposes live GPU and inference statistics in Prometheus format at `http://triton_server:8002/metrics`. The cell below pulls the key GPU metrics — utilization, memory, and per-model inference count — directly from that endpoint.
+
+
+```python
+import requests as _req
+
+def triton_gpu_stats():
+    """Fetch GPU utilization and memory from Triton's Prometheus metrics endpoint."""
+    try:
+        lines = _req.get("http://triton_server:8002/metrics", timeout=2).text.splitlines()
+    except Exception as e:
+        print(f"Could not reach Triton metrics endpoint: {e}")
+        return
+    keys = {
+        "nv_gpu_utilization": "GPU utilization (%)",
+        "nv_gpu_memory_used_bytes": "GPU memory used (MB)",
+        "nv_gpu_memory_total_bytes": "GPU memory total (MB)",
+        "nv_inference_count": "Total inferences served",
+    }
+    print("Triton server-side GPU metrics:")
+    for line in lines:
+        for key, label in keys.items():
+            if line.startswith(key) and not line.startswith("#"):
+                val = float(line.split()[-1])
+                if "bytes" in key:
+                    val /= 1024 ** 2  # bytes -> MB
+                print(f"  {label}: {val:.1f}")
+
+triton_gpu_stats()
+```
+
+
 ---
 
 ## Part 1: Verify Triton is ready and models are loaded
@@ -3454,10 +3788,12 @@ latencies = []
 for _ in range(20):
     infer_global(client, single_emb)
 
+monitor.start()
 for _ in range(num_trials):
     start = time.time()
     infer_global(client, single_emb)
     latencies.append(time.time() - start)
+monitor.stop()
 
 latencies = np.array(latencies)
 print(f"Global MLP — Triton Single Sample (n={num_trials})")
@@ -3465,6 +3801,8 @@ print(f"  Median latency:       {np.median(latencies)*1000:.2f} ms")
 print(f"  95th percentile:      {np.percentile(latencies, 95)*1000:.2f} ms")
 print(f"  99th percentile:      {np.percentile(latencies, 99)*1000:.2f} ms")
 print(f"  Throughput:           {num_trials / latencies.sum():.2f} infer/s")
+monitor.summary("Global Triton single sample (client-side CPU)")
+triton_gpu_stats()
 ```
 
 

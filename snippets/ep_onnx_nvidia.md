@@ -79,6 +79,76 @@ import clip
 ```
 :::
 
+::: {.cell .markdown}
+
+## Resource monitoring
+
+The `ResourceMonitor` class polls `nvidia-smi` (GPU utilization and memory) and `psutil` (CPU and RAM) in a background thread. It runs alongside each execution provider benchmark so you can see exactly how much GPU memory and compute each EP consumes — the primary signal for right-sizing.
+
+:::
+
+::: {.cell .code}
+```python
+import subprocess
+import threading
+import psutil
+
+
+class ResourceMonitor:
+    """Polls nvidia-smi (GPU) and psutil (CPU/RAM) in a background thread."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.gpu_util = []
+        self.gpu_mem_used = []
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"], text=True
+                ).strip().split(",")
+                self.gpu_util.append(float(out[0]))
+                self.gpu_mem_used.append(float(out[1]))
+            except Exception:
+                pass  # nvidia-smi unavailable — GPU metrics skipped
+            self.cpu_percent.append(psutil.cpu_percent(interval=None))
+            self.ram_used_gb.append(psutil.virtual_memory().used / 1e9)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self.gpu_util.clear()
+        self.gpu_mem_used.clear()
+        self.cpu_percent.clear()
+        self.ram_used_gb.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def summary(self, label=""):
+        print(f"\nResource usage — {label}")
+        if self.gpu_util:
+            print(f"  GPU util:  avg={np.mean(self.gpu_util):5.1f}%  peak={max(self.gpu_util):5.1f}%")
+            print(f"  GPU mem:   avg={np.mean(self.gpu_mem_used):6.0f} MB  peak={max(self.gpu_mem_used):6.0f} MB")
+        print(f"  CPU util:  avg={np.mean(self.cpu_percent):5.1f}%  peak={max(self.cpu_percent):5.1f}%")
+        print(f"  RAM used:  avg={np.mean(self.ram_used_gb):5.2f} GB  peak={max(self.ram_used_gb):5.2f} GB")
+
+
+monitor = ResourceMonitor()
+print("ResourceMonitor ready.")
+```
+:::
+
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
@@ -597,8 +667,11 @@ Next, we'll try the CUDA execution provider, which will execute the MLP model on
 ```python
 # runs in jupyter container on node-serve-model
 onnx_model_path = "models/flickr_global.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider'])
 benchmark_session(ort_session)
+monitor.stop()
+monitor.summary("Global MLP — CUDAExecutionProvider")
 ort.get_device()
 ```
 :::
@@ -608,8 +681,11 @@ ort.get_device()
 # runs in jupyter container on node-serve-model
 # Personalized MLP - CUDA execution provider
 personal_onnx_path = "models/flickr_personalized.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(personal_onnx_path, providers=['CUDAExecutionProvider'])
 benchmark_personal_session(ort_session)
+monitor.stop()
+monitor.summary("Personalized MLP — CUDAExecutionProvider")
 ort.get_device()
 ```
 :::
@@ -632,8 +708,11 @@ The TensorRT execution provider will optimize the model for inference on NVIDIA 
 ```python
 # runs in jupyter container on node-serve-model
 onnx_model_path = "models/flickr_global.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(onnx_model_path, providers=['TensorrtExecutionProvider'])
 benchmark_session(ort_session)
+monitor.stop()
+monitor.summary("Global MLP — TensorrtExecutionProvider")
 ort.get_device()
 ```
 :::
@@ -643,8 +722,11 @@ ort.get_device()
 # runs in jupyter container on node-serve-model
 # Personalized MLP - TensorRT execution provider
 personal_onnx_path = "models/flickr_personalized.onnx"
+monitor.start()
 ort_session = ort.InferenceSession(personal_onnx_path, providers=['TensorrtExecutionProvider'])
 benchmark_personal_session(ort_session)
+monitor.stop()
+monitor.summary("Personalized MLP — TensorrtExecutionProvider")
 ort.get_device()
 ```
 :::
