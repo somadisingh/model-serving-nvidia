@@ -21,7 +21,7 @@ To run this experiment, you should have already created an account on Chameleon,
 ## Context
 
 
-The premise of this example is as follows: You are working as a machine learning engineer at a small startup. You have developed a two-stage image aesthetic scoring pipeline: a frozen CLIP ViT-L/14 vision encoder produces a 768-dimensional embedding, which is then fed through a lightweight MLP head (768 → 1024 → 128 → 64 → 16 → 1) that outputs a continuous aesthetic quality score from 0 to 10.
+The premise of this example is as follows: You are working as a machine learning engineer at a small startup. You have developed a two-stage image aesthetic scoring pipeline: a frozen CLIP ViT-L/14 vision encoder produces a 768-dimensional embedding, which is then fed through a lightweight MLP head (768 → 512 → 128 → 32 → 1 with sigmoid) that outputs a continuous aesthetic quality score from 0 to 1.
 
 Now that you have trained the MLP head, you are preparing to serve predictions using this model. Your manager has advised that since you are an early-stage startup, they can't afford much compute for serving models. Your manager wants you to prepare a few different options, that they will then price out among cloud providers and decide which to use:
 

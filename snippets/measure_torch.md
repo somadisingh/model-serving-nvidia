@@ -6,7 +6,7 @@
 First, we are going to measure the inference performance of an already-trained PyTorch model on CPU. Our full inference pipeline has two stages:
 
 1. **CLIP ViT-L/14** (image encoder): Takes a raw image and produces a 768-dimensional embedding vector
-2. **Aesthetic MLP head**: Takes the 768-dim embedding and produces an aesthetic quality score (0-10)
+2. **Aesthetic MLP head**: Takes the 768-dim embedding and produces an aesthetic quality score (0-1)
 
 We will benchmark each stage independently, then measure the end-to-end pipeline. After completing this section, you should understand:
 
@@ -312,7 +312,7 @@ with torch.no_grad():
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print("Sample predicted aesthetic scores (0-10):")
+print("Sample predicted aesthetic scores (0-1):")
 for i in range(min(5, len(scores))):
     print(f"  Image {i+1}: {scores[i].item():.2f}")
 print(f"\nBatch mean: {mean_score:.2f}, std: {std_score:.2f}")

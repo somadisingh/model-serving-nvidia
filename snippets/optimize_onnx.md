@@ -291,7 +291,7 @@ q_model.save_model_to_file("models/flickr_global_quantized_dynamic.onnx")
 Download the `flickr_global_quantized_dynamic.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `flickr_global_quantized_dynamic.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `flickr_global.onnx` and review the graph. Then, upload the `flickr_global_quantized_dynamic.onnx` and see what has changed in the quantized graph.
 
 Note that some of our operations have become integer operations, but we have added additional operations to quantize and dequantize activations throughout the graph. 
 
@@ -441,7 +441,7 @@ q_model.save_model_to_file("models/flickr_global_quantized_aggressive.onnx")
 Download the `flickr_global_quantized_aggressive.onnx` model from inside the `models` directory. 
 
 
-To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `aesthetic_mlp.onnx` and review the graph. Then, upload the `flickr_global_quantized_aggressive.onnx` and see what has changed in the quantized graph.
+To see the effect of the graph optimizations, we can visualize the models using [Netron](https://netron.app/). Upload the original `flickr_global.onnx` and review the graph. Then, upload the `flickr_global_quantized_aggressive.onnx` and see what has changed in the quantized graph.
 
 Note that within the parameters for each quantized operation, we now have a "scale" and "zero point" - these are used to convert the FP32 values to INT8 values, as described above. The optimal scale and zero point for weights is determined by the fitted weights themselves, but the calibration dataset was required to find the optimal scale and zero point for activations.
 

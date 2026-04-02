@@ -165,7 +165,7 @@ with torch.no_grad():
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print("Sample predicted aesthetic scores (0-10):")
+print("Sample predicted aesthetic scores (0-1):")
 for i in range(min(5, len(scores))):
     print(f"  Image {i+1}: {scores[i]:.2f}")
 print(f"\nBatch mean: {mean_score:.2f}, std: {std_score:.2f}")
@@ -292,7 +292,7 @@ print(f"Batch Throughput: {batch_fps:.2f} FPS")
 ```
 :::
 
-<!-- summary for aesthetic_mlp
+<!-- summary for flickr_global
 
 Model Size on Disk: 8.92 MB
 Accuracy: 90.59% (3032/3347 correct)
@@ -323,7 +323,7 @@ Batch Throughput: 1103.28 FPS
 -->
 
 
-<!-- summary for aesthetic_mlp with graph optimization
+<!-- summary for flickr_global with graph optimization
 
 Model Size on Disk: 8.91 MB
 Accuracy: 90.59% (3032/3347 correct)
