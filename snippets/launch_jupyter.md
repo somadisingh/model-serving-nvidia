@@ -4,24 +4,25 @@
 
 ## Launch a Jupyter container
 
-Inside the SSH session, build the `jupyter-onnx-base` image:
+Inside the SSH session, build the `jupyter-onnx-gpu` image (includes CUDA, TensorRT, and all packages needed for notebooks 5–8):
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-base -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-base .
+docker build -t jupyter-onnx-gpu -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-nvidia .
 ```
 
-Then, launch a container from the `jupyter-onnx-base` image:
+Then, launch a container from the `jupyter-onnx-gpu` image with GPU access:
 
 ```bash
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
+    --gpus all \
     --shm-size 16G \
     -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \
-    jupyter-onnx-base
+    jupyter-onnx-gpu
 ```
 
 To access the Jupyter service, we will need its randomly generated secret token (which secures it from unauthorized access).

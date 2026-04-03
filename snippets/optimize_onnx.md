@@ -47,8 +47,9 @@ from PIL import Image
 ```python
 # runs in jupyter container on node-serve-model
 # Load CLIP model for computing image embeddings
-device = torch.device("cpu")
-clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+device = torch.device("cpu")  # ONNX sessions use CPUExecutionProvider
+clip_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # ViT encoding uses GPU
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=clip_device)
 
 def normalized(a, axis=-1, order=2):
     l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
@@ -74,7 +75,7 @@ test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 print("Pre-computing CLIP embeddings for benchmark data...")
 with torch.no_grad():
     batch_images, _ = next(iter(test_loader))
-    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_features = clip_model.encode_image(batch_images.to(clip_device))
     batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
     single_embedding = batch_embeddings[:1]
 print(f"Embeddings shape: {batch_embeddings.shape}")
@@ -87,7 +88,7 @@ print(f"Embeddings shape: {batch_embeddings.shape}")
 # Pre-compute FULL test embeddings for quality metrics (one-time cost; reused across all variants).
 # The tiny MLP is then benchmarked 4 times on these embeddings — no CLIP re-run per variant.
 print("Pre-computing test embeddings for quality metrics...")
-print("(Runs the full CLIP encoder over the test set once; may take several minutes on CPU.)")
+print("(GPU CLIP encoding over the test set — should complete in 1-3 minutes.)")
 
 _g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
 _test_g = _g_manifest[_g_manifest["split"] == "inference"].reset_index(drop=True)
@@ -106,7 +107,7 @@ with torch.no_grad():
                 pass
         if not _imgs:
             continue
-        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(clip_device))
         _qm_g_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
         _qm_g_tgts.extend(_tgts)
         if (_i // 32) % 20 == 0:
@@ -135,7 +136,7 @@ with torch.no_grad():
                 pass
         if not _imgs:
             continue
-        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(clip_device))
         _qm_p_embs_list.append(normalized(_feats.cpu().numpy()).astype(np.float32))
         _qm_p_tgts.extend(_tgts)
         _qm_p_uidxs.extend(_uids)
@@ -605,7 +606,7 @@ print("Pre-computing CLIP embeddings for calibration data...")
 cal_embeddings = []
 with torch.no_grad():
     for images, _ in val_loader:
-        features = clip_model.encode_image(images.to(device))
+        features = clip_model.encode_image(images.to(clip_device))
         embs = normalized(features.cpu().numpy()).astype(np.float32)
         cal_embeddings.append(embs)
 cal_embeddings = np.vstack(cal_embeddings)

@@ -10,54 +10,9 @@ In this notebook, we will:
 2. Measure the **end-to-end pipeline on GPU** (image → ViT → MLP → score)
 3. Test the **MLP head with different ONNX execution providers** (CPU, CUDA, TensorRT, OpenVINO)
 
-Before we can use the GPU, we need to switch from the `jupyter-onnx-base` image to the `jupyter-onnx-gpu` image.
+You are already running in the `jupyter-onnx-gpu` container that was launched in notebook 4 — no container switch is needed for Parts 1, 2, and 3 (CUDA and TensorRT execution providers).
 
-Close the current Jupyter server tab - you will reopen it shortly, with a new token.
-
-Go back to your SSH session on "node-serve-model", and stop the current Jupyter server with:
-
-```bash
-# runs on node-serve-model
-docker stop jupyter
-```
-
-Build the GPU image:
-
-```bash
-# runs on node-serve-model
-docker build -t jupyter-onnx-gpu -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-nvidia .
-```
-
-Then launch a new one with the GPU image:
-
-```bash
-# runs on node-serve-model
-docker run  -d --rm  -p 8888:8888 \
-    --gpus all \
-    --shm-size 16G \
-    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
-    -v aesthetic_data:/mnt/ \
-    -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
-    --name jupyter \
-    jupyter-onnx-gpu
-```
-
-Then get a new token:
-
-```bash
-# runs on node-serve-model
-docker exec jupyter jupyter server list
-```
-
-and look for a line like
-
-```
-http://localhost:8888/?token=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
-```
-
-Paste this into a browser tab, but in place of `localhost`, substitute the floating IP assigned to your instance, to open the Jupyter notebook interface that is running *on your compute instance*.
-
-Then, in the file browser on the left side, open the "work" directory and then click on the `8_ep_onnx.ipynb` notebook to continue.
+> **Note**: The OpenVINO execution provider requires a separate container. Instructions for switching are provided in the OpenVINO section later in this notebook.
 
 :::
 
@@ -811,14 +766,8 @@ print(f"  PLCC:             {_trt_plcc:.4f}")
 print(f"  SRCC:             {_trt_srcc:.4f}")
 print(f"  Binary accuracy:  {_trt_acc:.4f}  (threshold=0.5)")
 print(f"  AUC-ROC:          {_trt_auc:.4f}")
-print("Compare with FP32 CUDA EP metrics: any drop indicates FP16 precision trade-off.")
-```
-:::
-
-::: {.cell .code}
-```python
-# runs in jupyter container on node-serve-model
-# Personalized MLP - TensorRT execution provider
+print("Compare with FP32 CUDA EP metrics: any drop indicates TF32/FP16 precision trade-off.")
+print("(On Ampere/A100, TRT defaults to TF32 for matmuls; FP16 requires explicit trt_fp16_enable=True.)")
 personal_onnx_path = "models/flickr_personalized.onnx"
 monitor.start()
 ort_session = ort.InferenceSession(personal_onnx_path, providers=['TensorrtExecutionProvider'])
@@ -849,11 +798,8 @@ print(f"{'─'*60}")
 print(f"  Users evaluated:    {len(_trt_per_srcc)}")
 print(f"  Mean per-user SRCC: {np.mean(_trt_per_srcc):.4f}")
 print(f"  Mean per-user MAE:  {np.mean(_trt_per_mae):.4f}")
-print("Compare with FP32 CUDA EP metrics: any drop indicates FP16 precision trade-off.")
-```
-:::
-
-<!-- placeholder: update with real benchmark numbers -->
+print("Compare with FP32 CUDA EP metrics: any drop indicates TF32/FP16 precision trade-off.")
+print("(On Ampere/A100, TRT defaults to TF32 for matmuls; FP16 requires explicit trt_fp16_enable=True.)")
 
 
 ::: {.cell .markdown} 

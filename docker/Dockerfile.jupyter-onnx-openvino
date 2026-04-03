@@ -5,6 +5,7 @@ RUN pip install --pre --no-cache-dir \
     'clip @ git+https://github.com/openai/CLIP.git' \
     'gdown' \
     'onnx==1.18.0' \
-    'onnxruntime-openvino' && \
+    'onnxruntime-openvino' \
+    'psutil' && \
     fix-permissions "${CONDA_DIR}" && \
     fix-permissions "/home/${NB_USER}"

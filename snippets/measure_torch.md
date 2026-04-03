@@ -1,7 +1,7 @@
 
 ::: {.cell .markdown}
 
-## Measure inference performance of PyTorch model on CPU 
+## Measure inference performance of PyTorch model on GPU 
 
 First, we are going to measure the inference performance of an already-trained PyTorch model on CPU. Our full inference pipeline has two stages:
 
@@ -106,7 +106,7 @@ print("ResourceMonitor ready.")
 
 ::: {.cell .markdown}
 
-First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute image embeddings). Note that for now, we will use the CPU for inference, not GPU.
+First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute image embeddings). We run all inference on the **GPU** — the A100's tensor cores make ViT encoding orders of magnitude faster than CPU.
 
 :::
 
@@ -114,7 +114,8 @@ First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute imag
 ```python
 # runs in jupyter container on node-serve-model
 model_path = "models/flickr_global_best_inference_only.pth"  
-device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 model = torch.load(model_path, map_location=device, weights_only=False)
 model.eval()
 
@@ -148,9 +149,9 @@ test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers
 
 ---
 
-## Part 1: CLIP ViT-L/14 Image Encoder (CPU)
+## Part 1: CLIP ViT-L/14 Image Encoder (GPU)
 
-The ViT-L/14 model is the computationally expensive part of the pipeline. It processes raw images (224×224) through a Vision Transformer to produce 768-dimensional embeddings. Let's measure its performance on CPU in **eager mode** first.
+The ViT-L/14 model is the computationally expensive part of the pipeline. It processes raw images (224×224) through a Vision Transformer to produce 768-dimensional embeddings. Let's measure its performance on GPU in **eager mode** first.
 
 :::
 
@@ -200,18 +201,22 @@ monitor.start()
 vit_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         clip_model.encode_image(single_image)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         latencies_i = time.time() - start_time
         vit_latencies_eager.append(latencies_i)
 monitor.stop()
 
-print("ViT-L/14 Single Image Latency (Eager, CPU):")
+print("ViT-L/14 Single Image Latency (Eager, GPU):")
 print(f"  Median: {np.percentile(vit_latencies_eager, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(vit_latencies_eager, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(vit_latencies_eager, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(vit_latencies_eager):.2f} FPS")
-monitor.summary("ViT-L/14 eager single image (CPU)")
+monitor.summary("ViT-L/14 eager single image (GPU)")
 ```
 :::
 
@@ -237,19 +242,23 @@ with torch.no_grad():
 vit_batch_times_eager = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         clip_model.encode_image(batch_images)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         vit_batch_times_eager.append(time.time() - start_time)
 
 vit_batch_fps_eager = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_eager)
-print(f"ViT-L/14 Batch Throughput (Eager, CPU, batch_size=32): {vit_batch_fps_eager:.2f} FPS")
+print(f"ViT-L/14 Batch Throughput (Eager, GPU, batch_size=32): {vit_batch_fps_eager:.2f} FPS")
 ```
 :::
 
 
 ::: {.cell .markdown}
 
-#### ViT compiled mode (CPU)
+#### ViT compiled mode (GPU)
 
 Now let's compile the ViT visual encoder into a graph and see if we get a speedup. Graph compilation can fuse operations and optimize memory access patterns.
 
@@ -276,11 +285,15 @@ print("Compilation complete.")
 vit_latencies_compiled = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         clip_model.encode_image(single_image)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         vit_latencies_compiled.append(time.time() - start_time)
 
-print("ViT-L/14 Single Image Latency (Compiled, CPU):")
+print("ViT-L/14 Single Image Latency (Compiled, GPU):")
 print(f"  Median: {np.percentile(vit_latencies_compiled, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(vit_latencies_compiled, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(vit_latencies_compiled, 99) * 1000:.2f} ms")
@@ -295,18 +308,22 @@ print(f"  Throughput: {num_trials / np.sum(vit_latencies_compiled):.2f} FPS")
 vit_batch_times_compiled = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         clip_model.encode_image(batch_images)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         vit_batch_times_compiled.append(time.time() - start_time)
 
 vit_batch_fps_compiled = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_compiled)
-print(f"ViT-L/14 Batch Throughput (Compiled, CPU, batch_size=32): {vit_batch_fps_compiled:.2f} FPS")
+print(f"ViT-L/14 Batch Throughput (Compiled, GPU, batch_size=32): {vit_batch_fps_compiled:.2f} FPS")
 ```
 :::
 
 ::: {.cell .markdown}
 
-#### ViT CPU summary
+#### ViT GPU summary
 
 :::
 
@@ -314,7 +331,7 @@ print(f"ViT-L/14 Batch Throughput (Compiled, CPU, batch_size=32): {vit_batch_fps
 ```python
 # runs in jupyter container on node-serve-model
 print("=" * 60)
-print("CLIP ViT-L/14 CPU Benchmark Summary")
+print("CLIP ViT-L/14 GPU Benchmark Summary")
 print("=" * 60)
 print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
 print("-" * 60)
@@ -330,7 +347,7 @@ print(f"{'Batch throughput (FPS, batch_size=32)':<45} {vit_batch_fps_eager:>8.2f
 
 ---
 
-## Part 2: Aesthetic MLP Head (CPU)
+## Part 2: Aesthetic MLP Head (GPU)
 
 Now we'll benchmark the lightweight MLP head that maps 768-dim CLIP embeddings to aesthetic scores. Since we'll compare eager vs compiled mode, we'll first reload the models fresh.
 
@@ -420,8 +437,12 @@ with torch.no_grad():
 mlp_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = model(single_embedding)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         mlp_latencies_eager.append(time.time() - start_time)
 ```
 :::
@@ -429,7 +450,7 @@ with torch.no_grad():
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print("MLP Single Sample Latency (Eager, CPU):")
+print("MLP Single Sample Latency (Eager, GPU):")
 print(f"  Median: {np.percentile(mlp_latencies_eager, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(mlp_latencies_eager, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(mlp_latencies_eager, 99) * 1000:.2f} ms")
@@ -461,19 +482,23 @@ with torch.no_grad():
 mlp_batch_times_eager = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = model(batch_embeddings)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         mlp_batch_times_eager.append(time.time() - start_time)
 
 mlp_batch_fps_eager = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_eager)
-print(f"MLP Batch Throughput (Eager, CPU, batch_size=32): {mlp_batch_fps_eager:.2f} FPS")
+print(f"MLP Batch Throughput (Eager, GPU, batch_size=32): {mlp_batch_fps_eager:.2f} FPS")
 ```
 :::
 
 
 ::: {.cell .markdown}
 
-#### MLP compiled mode (CPU)
+#### MLP compiled mode (GPU)
 
 :::
 
@@ -496,11 +521,15 @@ print("Compilation complete.")
 mlp_latencies_compiled = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = model(single_embedding)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         mlp_latencies_compiled.append(time.time() - start_time)
 
-print("MLP Single Sample Latency (Compiled, CPU):")
+print("MLP Single Sample Latency (Compiled, GPU):")
 print(f"  Median: {np.percentile(mlp_latencies_compiled, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(mlp_latencies_compiled, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(mlp_latencies_compiled, 99) * 1000:.2f} ms")
@@ -514,19 +543,23 @@ print(f"  Throughput: {num_trials/np.sum(mlp_latencies_compiled):.2f} FPS")
 mlp_batch_times_compiled = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = model(batch_embeddings)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         mlp_batch_times_compiled.append(time.time() - start_time)
 
 mlp_batch_fps_compiled = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_compiled)
-print(f"MLP Batch Throughput (Compiled, CPU, batch_size=32): {mlp_batch_fps_compiled:.2f} FPS")
+print(f"MLP Batch Throughput (Compiled, GPU, batch_size=32): {mlp_batch_fps_compiled:.2f} FPS")
 ```
 :::
 
 
 ::: {.cell .markdown}
 
-#### MLP CPU summary
+#### MLP GPU summary
 
 :::
 
@@ -534,7 +567,7 @@ print(f"MLP Batch Throughput (Compiled, CPU, batch_size=32): {mlp_batch_fps_comp
 ```python
 # runs in jupyter container on node-serve-model
 print("=" * 60)
-print("Aesthetic MLP Head CPU Benchmark Summary")
+print("Aesthetic MLP Head GPU Benchmark Summary")
 print("=" * 60)
 print(f"MLP Model Size on Disk: {mlp_model_size / (1e6):.2f} MB")
 print(f"Mean Predicted Score: {mean_score:.2f} (std: {std_score:.2f})")
@@ -552,7 +585,7 @@ print(f"{'Batch throughput (FPS, batch_size=32)':<45} {mlp_batch_fps_eager:>8.2f
 
 ---
 
-## Part 3: Personalized MLP Head (CPU)
+## Part 3: Personalized MLP Head (GPU)
 
 The personalized model takes both a 768-dim CLIP embedding and a user index as input. It has an `nn.Embedding` table that maps each user index to a 64-dim learned vector, concatenates it with the CLIP embedding (832-dim total), and passes through the same MLP architecture. This lets the model learn per-user aesthetic preferences.
 
@@ -649,8 +682,12 @@ with torch.no_grad():
 personal_mlp_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = personal_model(p_single_embedding, p_single_user_idx)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         personal_mlp_latencies_eager.append(time.time() - start_time)
 ```
 :::
@@ -658,7 +695,7 @@ with torch.no_grad():
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-print("Personalized MLP Single Sample Latency (Eager, CPU):")
+print("Personalized MLP Single Sample Latency (Eager, GPU):")
 print(f"  Median: {np.percentile(personal_mlp_latencies_eager, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(personal_mlp_latencies_eager, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(personal_mlp_latencies_eager, 99) * 1000:.2f} ms")
@@ -692,19 +729,23 @@ with torch.no_grad():
 personal_mlp_batch_times_eager = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = personal_model(p_batch_embeddings, p_batch_user_idx)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         personal_mlp_batch_times_eager.append(time.time() - start_time)
 
 personal_mlp_batch_fps_eager = (p_batch_embeddings.shape[0] * num_batches) / np.sum(personal_mlp_batch_times_eager)
-print(f"Personalized MLP Batch Throughput (Eager, CPU, batch_size=32): {personal_mlp_batch_fps_eager:.2f} FPS")
+print(f"Personalized MLP Batch Throughput (Eager, GPU, batch_size=32): {personal_mlp_batch_fps_eager:.2f} FPS")
 ```
 :::
 
 
 ::: {.cell .markdown}
 
-#### Personalized MLP compiled mode (CPU)
+#### Personalized MLP compiled mode (GPU)
 
 :::
 
@@ -727,11 +768,15 @@ print("Compilation complete.")
 personal_mlp_latencies_compiled = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = personal_model(p_single_embedding, p_single_user_idx)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         personal_mlp_latencies_compiled.append(time.time() - start_time)
 
-print("Personalized MLP Single Sample Latency (Compiled, CPU):")
+print("Personalized MLP Single Sample Latency (Compiled, GPU):")
 print(f"  Median: {np.percentile(personal_mlp_latencies_compiled, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(personal_mlp_latencies_compiled, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(personal_mlp_latencies_compiled, 99) * 1000:.2f} ms")
@@ -745,19 +790,23 @@ print(f"  Throughput: {num_trials/np.sum(personal_mlp_latencies_compiled):.2f} F
 personal_mlp_batch_times_compiled = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         _ = personal_model(p_batch_embeddings, p_batch_user_idx)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         personal_mlp_batch_times_compiled.append(time.time() - start_time)
 
 personal_mlp_batch_fps_compiled = (p_batch_embeddings.shape[0] * num_batches) / np.sum(personal_mlp_batch_times_compiled)
-print(f"Personalized MLP Batch Throughput (Compiled, CPU, batch_size=32): {personal_mlp_batch_fps_compiled:.2f} FPS")
+print(f"Personalized MLP Batch Throughput (Compiled, GPU, batch_size=32): {personal_mlp_batch_fps_compiled:.2f} FPS")
 ```
 :::
 
 
 ::: {.cell .markdown}
 
-#### Personalized MLP CPU summary
+#### Personalized MLP GPU summary
 
 :::
 
@@ -765,7 +814,7 @@ print(f"Personalized MLP Batch Throughput (Compiled, CPU, batch_size=32): {perso
 ```python
 # runs in jupyter container on node-serve-model
 print("=" * 65)
-print("Personalized MLP Head CPU Benchmark Summary")
+print("Personalized MLP Head GPU Benchmark Summary")
 print("=" * 65)
 print(f"Personalized MLP Model Size on Disk: {personal_mlp_model_size / (1e6):.2f} MB")
 print()
@@ -784,7 +833,7 @@ print(f"{'Batch throughput (FPS, batch_size=32)':<45} {personal_mlp_batch_fps_ea
 
 ---
 
-## Part 4: End-to-End Pipeline (CPU)
+## Part 4: End-to-End Pipeline (GPU)
 
 Finally, let's measure the full pipeline: image → ViT → normalize → MLP → score. This shows the total latency a user would experience. We'll reload fresh (uncompiled) models.
 
@@ -820,18 +869,22 @@ monitor.start()
 e2e_latencies = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         feat = clip_model.encode_image(single_image)
         emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
         _ = model(emb)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         e2e_latencies.append(time.time() - start_time)
 monitor.stop()
 
-print("End-to-End Single Image Latency (CPU):")
+print("End-to-End Single Image Latency (GPU):")
 print(f"  Median: {np.percentile(e2e_latencies, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(e2e_latencies, 95) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(e2e_latencies):.2f} FPS")
-monitor.summary("E2E pipeline single image (CPU)")
+monitor.summary("E2E pipeline single image (GPU)")
 ```
 :::
 
@@ -845,20 +898,24 @@ batch_images = batch_images.to(device)
 e2e_batch_times = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         feat = clip_model.encode_image(batch_images)
         emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
         _ = model(emb)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         e2e_batch_times.append(time.time() - start_time)
 
 e2e_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_batch_times)
-print(f"End-to-End Batch Throughput (CPU, batch_size=32): {e2e_batch_fps:.2f} FPS")
+print(f"End-to-End Batch Throughput (GPU, batch_size=32): {e2e_batch_fps:.2f} FPS")
 ```
 :::
 
 ::: {.cell .markdown}
 
-#### End-to-End: Personalized MLP (CPU)
+#### End-to-End: Personalized MLP (GPU)
 
 The personalized pipeline adds a user index lookup, but the ViT encode step is identical.
 
@@ -879,13 +936,17 @@ with torch.no_grad():
 e2e_personal_latencies = []
 with torch.no_grad():
     for _ in range(num_trials):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         feat = clip_model.encode_image(single_image)
         emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
         _ = personal_model(emb, p_user_idx_single)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         e2e_personal_latencies.append(time.time() - start_time)
 
-print("End-to-End Single Image Latency - Personalized (CPU):")
+print("End-to-End Single Image Latency - Personalized (GPU):")
 print(f"  Median: {np.percentile(e2e_personal_latencies, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(e2e_personal_latencies, 95) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(e2e_personal_latencies):.2f} FPS")
@@ -901,14 +962,18 @@ p_user_idx_batch = torch.zeros(batch_images.shape[0], dtype=torch.long, device=d
 e2e_personal_batch_times = []
 with torch.no_grad():
     for _ in range(num_batches):
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         start_time = time.time()
         feat = clip_model.encode_image(batch_images)
         emb = torch.from_numpy(normalized(feat.cpu().numpy())).float().to(device)
         _ = personal_model(emb, p_user_idx_batch)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         e2e_personal_batch_times.append(time.time() - start_time)
 
 e2e_personal_batch_fps = (batch_images.shape[0] * num_batches) / np.sum(e2e_personal_batch_times)
-print(f"End-to-End Batch Throughput - Personalized (CPU, batch_size=32): {e2e_personal_batch_fps:.2f} FPS")
+print(f"End-to-End Batch Throughput - Personalized (GPU, batch_size=32): {e2e_personal_batch_fps:.2f} FPS")
 ```
 :::
 
@@ -923,7 +988,7 @@ e2e_median = np.percentile(e2e_latencies, 50) * 1000
 e2e_personal_median = np.percentile(e2e_personal_latencies, 50) * 1000
 
 print("=" * 55)
-print("End-to-End Latency Breakdown (CPU, single image)")
+print("End-to-End Latency Breakdown (GPU, single image)")
 print("=" * 55)
 print(f"  ViT encode:            {vit_median:.2f} ms ({vit_median/e2e_median*100:.1f}%)")
 print(f"  Global MLP forward:    {mlp_median:.2f} ms ({mlp_median/e2e_median*100:.1f}%)")
@@ -1051,12 +1116,13 @@ global_test.head()
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-# Reload clean CPU models (without compile artifacts)
+# Reload clean models (without compile artifacts)
 model_eval = torch.load("models/flickr_global_best_inference_only.pth",
                         map_location=device, weights_only=False)
 model_eval.eval()
 clip_eval, clip_pre_eval = clip.load("ViT-L/14", device=device)
 
+print(f"Running GPU CLIP encoding over test set (~1-3 minutes)...")
 global_preds, global_targets = collect_global_predictions(
     global_test, image_root_global, clip_eval, model_eval, device, clip_pre_eval
 )

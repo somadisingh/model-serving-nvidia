@@ -40,8 +40,9 @@ from PIL import Image
 ```python
 # runs in jupyter container on node-serve-model
 # Load CLIP model for computing image embeddings
-device = torch.device("cpu")
-clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+device = torch.device("cpu")  # ONNX sessions use CPUExecutionProvider
+clip_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # ViT encoding uses GPU
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=clip_device)
 
 def normalized(a, axis=-1, order=2):
     l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
@@ -157,7 +158,7 @@ First, let's verify the model produces reasonable aesthetic scores:
 # runs in jupyter container on node-serve-model
 with torch.no_grad():
     images, _ = next(iter(test_loader))
-    image_features = clip_model.encode_image(images.to(device))
+    image_features = clip_model.encode_image(images.to(clip_device))
     embeddings = normalized(image_features.cpu().numpy()).astype(np.float32)
     outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: embeddings})[0]
     scores = outputs.flatten()
@@ -211,7 +212,7 @@ num_trials = 100  # Number of trials
 # Pre-compute a single CLIP embedding for benchmarking
 with torch.no_grad():
     sample_image, _ = next(iter(test_loader))
-    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    sample_features = clip_model.encode_image(sample_image[:1].to(clip_device))
     single_embedding = normalized(sample_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
@@ -253,7 +254,7 @@ num_batches = 50  # Number of trials
 # Pre-compute a batch of CLIP embeddings for benchmarking
 with torch.no_grad():
     batch_images, _ = next(iter(test_loader))
-    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_features = clip_model.encode_image(batch_images.to(clip_device))
     batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
@@ -312,7 +313,7 @@ global_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_
 test_g_q = global_manifest_q[global_manifest_q["split"] == "inference"].reset_index(drop=True)
 image_root_q = os.path.join(data_dir, "40K")
 print(f"Test set: {len(test_g_q)} images — running CLIP encoding + ONNX inference...")
-print("(This may take several minutes on CPU.)")
+print("(GPU CLIP encoding — should complete in 1-3 minutes.)")
 
 all_preds_g, all_targets_g = [], []
 with torch.no_grad():
@@ -327,7 +328,7 @@ with torch.no_grad():
                 pass
         if not _imgs:
             continue
-        _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(clip_device))
         _embs = normalized(_feats.cpu().numpy()).astype(np.float32)
         _preds = ort_session.run(None, {ort_session.get_inputs()[0].name: _embs})[0].flatten()
         all_preds_g.extend(_preds.tolist())
@@ -520,7 +521,7 @@ print(f"Inputs: {[(i.name, i.shape, i.type) for i in personal_ort_session.get_in
 # runs in jupyter container on node-serve-model
 with torch.no_grad():
     images, _ = next(iter(test_loader))
-    image_features = clip_model.encode_image(images.to(device))
+    image_features = clip_model.encode_image(images.to(clip_device))
     p_embeddings = normalized(image_features.cpu().numpy()).astype(np.float32)
     p_user_idx = np.zeros(p_embeddings.shape[0], dtype=np.int64)
     
@@ -575,7 +576,7 @@ num_trials = 100
 # Pre-compute a single CLIP embedding for benchmarking
 with torch.no_grad():
     sample_image, _ = next(iter(test_loader))
-    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    sample_features = clip_model.encode_image(sample_image[:1].to(clip_device))
     p_single_embedding = normalized(sample_features.cpu().numpy()).astype(np.float32)
     p_single_user_idx = np.array([0], dtype=np.int64)
 
@@ -615,7 +616,7 @@ num_batches = 50
 # Pre-compute a batch of CLIP embeddings
 with torch.no_grad():
     batch_images, _ = next(iter(test_loader))
-    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_features = clip_model.encode_image(batch_images.to(clip_device))
     p_batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
     p_batch_user_idx = np.zeros(p_batch_embeddings.shape[0], dtype=np.int64)
 
@@ -676,7 +677,7 @@ image_root_p = os.path.join(data_dir, "40K")
 input_names_p = [i.name for i in personal_ort_session.get_inputs()]
 test_workers_q = [w for w in test_p_q["worker_id"].unique() if w in user2idx]
 print(f"Personalized test: {len(test_p_q)} rows, {len(test_workers_q)} known workers")
-print("(Running CLIP + ONNX per worker — may take several minutes on CPU.)")
+print("(Running CLIP + ONNX per worker — GPU CLIP encoding, ~5-10 minutes.)")
 
 per_user_srcc_q, per_user_mae_q = [], []
 for worker_id in test_workers_q:
@@ -697,7 +698,7 @@ for worker_id in test_workers_q:
                     pass
             if not _imgs:
                 continue
-            _feats = clip_model.encode_image(torch.stack(_imgs).to(device))
+            _feats = clip_model.encode_image(torch.stack(_imgs).to(clip_device))
             _embs = normalized(_feats.cpu().numpy()).astype(np.float32)
             _uids = np.full(len(_imgs), uid, dtype=np.int64)
             _preds = personal_ort_session.run(None, {input_names_p[0]: _embs, input_names_p[1]: _uids})[0].flatten()

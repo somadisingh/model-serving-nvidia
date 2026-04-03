@@ -6,6 +6,7 @@ RUN pip install --pre --no-cache-dir \
     'gdown' \
     'onnx==1.18.0' \
     'onnxruntime' \
-    'neural-compressor==3.6' && \
+    'neural-compressor==2.6' \
+    'psutil' && \
     fix-permissions "${CONDA_DIR}" && \
     fix-permissions "/home/${NB_USER}"

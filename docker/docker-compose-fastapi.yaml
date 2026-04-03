@@ -28,4 +28,4 @@ services:
     volumes:
       - ../workspace:/home/jovyan/work
     command: >
-      bash -c "pip install requests numpy && start-notebook.sh"
+      bash -c "pip install requests numpy psutil && start-notebook.sh"

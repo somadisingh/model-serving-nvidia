@@ -18,21 +18,28 @@ Before running this notebook:
 
 1. Make sure you have generated the ONNX models by running notebooks 6 and 7 (at minimum `6_measure_onnx.ipynb` to produce `models/flickr_global.onnx` and `models/flickr_personalized.onnx`).
 
-2. On the Chameleon host, bring up the FastAPI containers:
+2. Stop the current Jupyter GPU container to free port 8888:
+
+```bash
+# runs on node-serve-model
+docker stop jupyter
+```
+
+3. On the Chameleon host, bring up the FastAPI containers:
 
 ```bash
 # runs on node-serve-model
 docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml up -d
 ```
 
-3. Get the Jupyter token:
+4. Get the Jupyter token:
 
 ```bash
 # runs on node-serve-model
 docker exec jupyter_fastapi jupyter server list
 ```
 
-4. Open this notebook in the Jupyter container at `http://<FLOATING_IP>:8888`.
+5. Open this notebook in the Jupyter container at `http://<FLOATING_IP>:8888`.
 
 :::
 
