@@ -30,6 +30,9 @@ from torchvision import datasets
 from torch.utils.data import DataLoader
 import pandas as pd
 import clip
+from scipy.stats import pearsonr, spearmanr
+from sklearn.metrics import roc_auc_score
+from PIL import Image
 ```
 :::
 
@@ -37,8 +40,9 @@ import clip
 ```python
 # runs in jupyter container on node-serve-model
 # Load CLIP model for computing image embeddings
-device = torch.device("cpu")
-clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
+device = torch.device("cpu")  # ONNX sessions use CPUExecutionProvider
+clip_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # ViT encoding uses GPU
+clip_model, clip_preprocess = clip.load("ViT-L/14", device=clip_device)
 
 def normalized(a, axis=-1, order=2):
     l2 = np.atleast_1d(np.linalg.norm(a, order, axis))
@@ -154,7 +158,7 @@ First, let's verify the model produces reasonable aesthetic scores:
 # runs in jupyter container on node-serve-model
 with torch.no_grad():
     images, _ = next(iter(test_loader))
-    image_features = clip_model.encode_image(images.to(device))
+    image_features = clip_model.encode_image(images.to(clip_device))
     embeddings = normalized(image_features.cpu().numpy()).astype(np.float32)
     outputs = ort_session.run(None, {ort_session.get_inputs()[0].name: embeddings})[0]
     scores = outputs.flatten()
@@ -208,7 +212,7 @@ num_trials = 100  # Number of trials
 # Pre-compute a single CLIP embedding for benchmarking
 with torch.no_grad():
     sample_image, _ = next(iter(test_loader))
-    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    sample_features = clip_model.encode_image(sample_image[:1].to(clip_device))
     single_embedding = normalized(sample_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
@@ -250,7 +254,7 @@ num_batches = 50  # Number of trials
 # Pre-compute a batch of CLIP embeddings for benchmarking
 with torch.no_grad():
     batch_images, _ = next(iter(test_loader))
-    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_features = clip_model.encode_image(batch_images.to(clip_device))
     batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
 
 # Warm-up run
@@ -290,6 +294,67 @@ print(f"Inference Latency (single sample, 95th percentile): {np.percentile(laten
 print(f"Inference Latency (single sample, 99th percentile): {np.percentile(latencies, 99) * 1000:.2f} ms")
 print(f"Inference Throughput (single sample): {num_trials/np.sum(latencies):.2f} FPS")
 print(f"Batch Throughput: {batch_fps:.2f} FPS")
+```
+:::
+
+::: {.cell .markdown}
+
+#### Quality metrics — Global FP32 ONNX baseline
+
+These metrics show how well the **FP32 ONNX model** predicts aesthetic scores on the held-out test split. Establish this baseline before quantizing in notebook 7.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Quality metrics: full test split — Global FP32 ONNX baseline
+global_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
+test_g_q = global_manifest_q[global_manifest_q["split"] == "inference"].reset_index(drop=True)
+image_root_q = os.path.join(data_dir, "40K")
+print(f"Test set: {len(test_g_q)} images — running CLIP encoding + ONNX inference...")
+print("(GPU CLIP encoding — should complete in 1-3 minutes.)")
+
+all_preds_g, all_targets_g = [], []
+with torch.no_grad():
+    for _i in range(0, len(test_g_q), 32):
+        _batch = test_g_q.iloc[_i:_i+32]
+        _imgs, _tgts = [], []
+        for _, _row in _batch.iterrows():
+            try:
+                _imgs.append(clip_preprocess(Image.open(os.path.join(image_root_q, _row["image_name"])).convert("RGB")))
+                _tgts.append(_row["global_score"])
+            except Exception:
+                pass
+        if not _imgs:
+            continue
+        _feats = clip_model.encode_image(torch.stack(_imgs).to(clip_device))
+        _embs = normalized(_feats.cpu().numpy()).astype(np.float32)
+        _preds = ort_session.run(None, {ort_session.get_inputs()[0].name: _embs})[0].flatten()
+        all_preds_g.extend(_preds.tolist())
+        all_targets_g.extend(_tgts)
+        if (_i // 32) % 20 == 0:
+            print(f"  {min(_i + 32, len(test_g_q))}/{len(test_g_q)} images ...")
+
+all_preds_g  = np.array(all_preds_g,  dtype=np.float32)
+all_targets_g = np.array(all_targets_g, dtype=np.float32)
+mae_g   = np.mean(np.abs(all_preds_g - all_targets_g))
+rmse_g  = np.sqrt(np.mean((all_preds_g - all_targets_g) ** 2))
+plcc_g, _ = pearsonr(all_preds_g, all_targets_g)
+srcc_g, _ = spearmanr(all_preds_g, all_targets_g)
+bin_acc_g = np.mean((all_preds_g >= 0.5) == (all_targets_g >= 0.5))
+auc_g   = roc_auc_score((all_targets_g >= 0.5).astype(int), all_preds_g)
+print(f"\n{'─'*55}")
+print(f"Quality metrics — Global FP32 ONNX (baseline)")
+print(f"{'─'*55}")
+print(f"  N:                {len(all_preds_g)}")
+print(f"  MAE:              {mae_g:.4f}")
+print(f"  RMSE:             {rmse_g:.4f}")
+print(f"  PLCC:             {plcc_g:.4f}")
+print(f"  SRCC:             {srcc_g:.4f}")
+print(f"  Binary accuracy:  {bin_acc_g:.4f}  (threshold=0.5)")
+print(f"  AUC-ROC:          {auc_g:.4f}")
+print("Compare with quantized / optimized variants in notebook 7.")
 ```
 :::
 
@@ -456,7 +521,7 @@ print(f"Inputs: {[(i.name, i.shape, i.type) for i in personal_ort_session.get_in
 # runs in jupyter container on node-serve-model
 with torch.no_grad():
     images, _ = next(iter(test_loader))
-    image_features = clip_model.encode_image(images.to(device))
+    image_features = clip_model.encode_image(images.to(clip_device))
     p_embeddings = normalized(image_features.cpu().numpy()).astype(np.float32)
     p_user_idx = np.zeros(p_embeddings.shape[0], dtype=np.int64)
     
@@ -511,7 +576,7 @@ num_trials = 100
 # Pre-compute a single CLIP embedding for benchmarking
 with torch.no_grad():
     sample_image, _ = next(iter(test_loader))
-    sample_features = clip_model.encode_image(sample_image[:1].to(device))
+    sample_features = clip_model.encode_image(sample_image[:1].to(clip_device))
     p_single_embedding = normalized(sample_features.cpu().numpy()).astype(np.float32)
     p_single_user_idx = np.array([0], dtype=np.int64)
 
@@ -551,7 +616,7 @@ num_batches = 50
 # Pre-compute a batch of CLIP embeddings
 with torch.no_grad():
     batch_images, _ = next(iter(test_loader))
-    batch_features = clip_model.encode_image(batch_images.to(device))
+    batch_features = clip_model.encode_image(batch_images.to(clip_device))
     p_batch_embeddings = normalized(batch_features.cpu().numpy()).astype(np.float32)
     p_batch_user_idx = np.zeros(p_batch_embeddings.shape[0], dtype=np.int64)
 
@@ -591,6 +656,68 @@ print(f"Inference Latency (single sample, 95th percentile): {np.percentile(p_lat
 print(f"Inference Latency (single sample, 99th percentile): {np.percentile(p_latencies, 99) * 1000:.2f} ms")
 print(f"Inference Throughput (single sample): {num_trials/np.sum(p_latencies):.2f} FPS")
 print(f"Batch Throughput: {p_batch_fps:.2f} FPS")
+```
+:::
+
+::: {.cell .markdown}
+
+#### Quality metrics — Personalized FP32 ONNX baseline
+
+Per-user SRCC and MAE across every annotator in the test split.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Quality metrics: Personalized FP32 ONNX — per-user SRCC and MAE
+p_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
+test_p_q = p_manifest_q[p_manifest_q["split"] == "inference"].reset_index(drop=True)
+image_root_p = os.path.join(data_dir, "40K")
+input_names_p = [i.name for i in personal_ort_session.get_inputs()]
+test_workers_q = [w for w in test_p_q["worker_id"].unique() if w in user2idx]
+print(f"Personalized test: {len(test_p_q)} rows, {len(test_workers_q)} known workers")
+print("(Running CLIP + ONNX per worker — GPU CLIP encoding, ~5-10 minutes.)")
+
+per_user_srcc_q, per_user_mae_q = [], []
+for worker_id in test_workers_q:
+    uid = user2idx[worker_id]
+    worker_df = test_p_q[test_p_q["worker_id"] == worker_id].reset_index(drop=True)
+    if len(worker_df) < 3:
+        continue
+    w_preds, w_targets = [], []
+    with torch.no_grad():
+        for _i in range(0, len(worker_df), 32):
+            _batch = worker_df.iloc[_i:_i+32]
+            _imgs, _tgts = [], []
+            for _, _row in _batch.iterrows():
+                try:
+                    _imgs.append(clip_preprocess(Image.open(os.path.join(image_root_p, _row["image_name"])).convert("RGB")))
+                    _tgts.append(_row["worker_score_norm"])
+                except Exception:
+                    pass
+            if not _imgs:
+                continue
+            _feats = clip_model.encode_image(torch.stack(_imgs).to(clip_device))
+            _embs = normalized(_feats.cpu().numpy()).astype(np.float32)
+            _uids = np.full(len(_imgs), uid, dtype=np.int64)
+            _preds = personal_ort_session.run(None, {input_names_p[0]: _embs, input_names_p[1]: _uids})[0].flatten()
+            w_preds.extend(_preds.tolist())
+            w_targets.extend(_tgts)
+    if len(w_preds) < 3:
+        continue
+    w_p = np.array(w_preds)
+    w_t = np.array(w_targets)
+    per_user_srcc_q.append(spearmanr(w_p, w_t)[0])
+    per_user_mae_q.append(np.mean(np.abs(w_p - w_t)))
+
+print(f"\n{'─'*55}")
+print(f"Quality metrics — Personalized FP32 ONNX (baseline)")
+print(f"{'─'*55}")
+print(f"  Users evaluated:    {len(per_user_srcc_q)}")
+print(f"  Mean per-user SRCC: {np.mean(per_user_srcc_q):.4f}")
+print(f"  Mean per-user MAE:  {np.mean(per_user_mae_q):.4f}")
+print("Compare with quantized variants in notebook 7.")
 ```
 :::
 

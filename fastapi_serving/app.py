@@ -40,7 +40,7 @@ class BatchScoreResponse(BaseModel):
 GLOBAL_MODEL_PATH = os.environ.get("GLOBAL_ONNX_PATH", "models/flickr_global.onnx")
 PERSONAL_MODEL_PATH = os.environ.get("PERSONAL_ONNX_PATH", "models/flickr_personalized.onnx")
 
-providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+providers = ["CPUExecutionProvider"]
 
 global_session = ort.InferenceSession(GLOBAL_MODEL_PATH, providers=providers)
 personal_session = ort.InferenceSession(PERSONAL_MODEL_PATH, providers=providers)

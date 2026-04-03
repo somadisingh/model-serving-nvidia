@@ -18,21 +18,28 @@ Before running this notebook:
 
 1. Make sure you have generated the ONNX models by running notebooks 6 and 7 (at minimum `6_measure_onnx.ipynb` to produce `models/flickr_global.onnx` and `models/flickr_personalized.onnx`).
 
-2. On the Chameleon host, bring up the FastAPI containers:
+2. Stop the current Jupyter GPU container to free port 8888:
+
+```bash
+# runs on node-serve-model
+docker stop jupyter
+```
+
+3. On the Chameleon host, bring up the FastAPI containers:
 
 ```bash
 # runs on node-serve-model
 docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml up -d
 ```
 
-3. Get the Jupyter token:
+4. Get the Jupyter token:
 
 ```bash
 # runs on node-serve-model
 docker exec jupyter_fastapi jupyter server list
 ```
 
-4. Open this notebook in the Jupyter container at `http://<FLOATING_IP>:8888`.
+5. Open this notebook in the Jupyter container at `http://<FLOATING_IP>:8888`.
 
 :::
 
@@ -42,6 +49,83 @@ import requests
 import time
 import numpy as np
 import concurrent.futures
+```
+:::
+
+::: {.cell .markdown}
+
+## Resource monitoring
+
+The `ResourceMonitor` class polls `psutil` (CPU and RAM) in a background thread during benchmarks. Because the Jupyter container in this setup does not have direct GPU access, **server-side GPU metrics** are best observed on the host with:
+
+```bash
+# runs on node-serve-model (in a separate terminal)
+watch -n 1 nvidia-smi
+# or
+docker stats fastapi_server
+```
+
+:::
+
+::: {.cell .code}
+```python
+import subprocess
+import threading
+import psutil
+
+
+class ResourceMonitor:
+    """Polls nvidia-smi (GPU) and psutil (CPU/RAM) in a background thread."""
+
+    def __init__(self, interval=0.5):
+        self.interval = interval
+        self._stop = threading.Event()
+        self.gpu_util = []
+        self.gpu_mem_used = []
+        self.cpu_percent = []
+        self.ram_used_gb = []
+        self._thread = None
+
+    def _poll(self):
+        while not self._stop.is_set():
+            try:
+                out = subprocess.check_output(
+                    ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used",
+                     "--format=csv,noheader,nounits"], text=True
+                ).strip().split(",")
+                self.gpu_util.append(float(out[0]))
+                self.gpu_mem_used.append(float(out[1]))
+            except Exception:
+                pass  # nvidia-smi unavailable — GPU metrics skipped
+            self.cpu_percent.append(psutil.cpu_percent(interval=None))
+            self.ram_used_gb.append(psutil.virtual_memory().used / 1e9)
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop.clear()
+        self.gpu_util.clear()
+        self.gpu_mem_used.clear()
+        self.cpu_percent.clear()
+        self.ram_used_gb.clear()
+        self._thread = threading.Thread(target=self._poll, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join()
+
+    def summary(self, label=""):
+        print(f"\nResource usage — {label}")
+        if self.gpu_util:
+            print(f"  GPU util:  avg={np.mean(self.gpu_util):5.1f}%  peak={max(self.gpu_util):5.1f}%")
+            print(f"  GPU mem:   avg={np.mean(self.gpu_mem_used):6.0f} MB  peak={max(self.gpu_mem_used):6.0f} MB")
+        print(f"  CPU util:  avg={np.mean(self.cpu_percent):5.1f}%  peak={max(self.cpu_percent):5.1f}%")
+        print(f"  RAM used:  avg={np.mean(self.ram_used_gb):5.2f} GB  peak={max(self.ram_used_gb):5.2f} GB")
+
+
+monitor = ResourceMonitor()
+print("ResourceMonitor ready.")
 ```
 :::
 
@@ -192,9 +276,11 @@ def run_concurrent_test(num_requests, payload, max_workers):
 ```python
 for concurrency in [1, 4, 8, 16]:
     num_requests = 500
+    monitor.start()
     wall_start = time.time()
     times = run_concurrent_test(num_requests, payload, max_workers=concurrency)
     wall_time = time.time() - wall_start
+    monitor.stop()
     throughput = num_requests / wall_time
     
     print(f"\nConcurrency={concurrency} (n={num_requests})")
@@ -202,6 +288,7 @@ for concurrency in [1, 4, 8, 16]:
     print(f"  95th percentile:      {np.percentile(times, 95)*1000:.2f} ms")
     print(f"  99th percentile:      {np.percentile(times, 99)*1000:.2f} ms")
     print(f"  Throughput:           {throughput:.2f} req/s")
+    monitor.summary(f"Global concurrent={concurrency}")
 ```
 :::
 

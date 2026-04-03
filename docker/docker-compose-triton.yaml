@@ -26,4 +26,4 @@ services:
     volumes:
       - ../workspace:/home/jovyan/work
     command: >
-      bash -c "pip install numpy tritonclient[all] && start-notebook.sh"
+      bash -c "pip install numpy psutil tritonclient[all] && start-notebook.sh"
