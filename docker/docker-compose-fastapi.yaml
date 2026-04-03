@@ -5,13 +5,6 @@ services:
       context: ../fastapi_serving
       dockerfile: Dockerfile
     container_name: fastapi_server
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
     ports:
       - "8000:8000"
     volumes:
@@ -21,11 +14,18 @@ services:
       - PERSONAL_ONNX_PATH=models/flickr_personalized.onnx
 
   jupyter:
-    image: quay.io/jupyter/minimal-notebook:latest
+    image: quay.io/jupyter/pytorch-notebook:cuda12-pytorch-2.5.1
     container_name: jupyter_fastapi
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     ports:
       - "8888:8888"
     volumes:
       - ../workspace:/home/jovyan/work
     command: >
-      bash -c "pip install requests numpy psutil && start-notebook.sh"
+      bash -c "pip install requests numpy psutil 'clip @ git+https://github.com/openai/CLIP.git' && start-notebook.sh"
