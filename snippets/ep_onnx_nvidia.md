@@ -110,6 +110,52 @@ print("ResourceMonitor ready.")
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
 # Load CLIP model on GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -295,7 +341,8 @@ Let's measure the full pipeline on GPU: image → ViT (GPU) → normalize → ML
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
 # Load MLP on CPU
-mlp_model = torch.load("models/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False)
+mlp_model = GlobalMLP()
+mlp_model.load_state_dict(torch.load("models/inference_only/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False))
 mlp_model.eval()
 
 num_trials = 50
@@ -371,7 +418,9 @@ We repeat the end-to-end measurement with the **PersonalizedMLP**, which takes a
 ```python
 # runs in jupyter container on node-serve-model
 # Load personalized model and prepare user indices
-personal_model = torch.load("models/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+_p_state = torch.load("models/inference_only/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+personal_model = PersonalizedMLP(num_users=_p_state["user_embedding.weight"].shape[0])
+personal_model.load_state_dict(_p_state)
 personal_model.eval()
 
 manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))

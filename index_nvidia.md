@@ -424,15 +424,68 @@ print("ResourceMonitor ready.")
 
 
 
+### Model architecture definitions
+
+The `.pth` files contain saved state dicts (model weights only). We need to define the same architectures used during training before loading the weights.
+
+
+```python
+# runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+
+
+
 First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute image embeddings). We run all inference on the **GPU** — the A100's tensor cores make ViT encoding orders of magnitude faster than CPU.
 
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/flickr_global_best_inference_only.pth"  
+model_path = "models/inference_only/flickr_global_best_inference_only.pth"  
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.to(device)
 model.eval()
 
 # Load CLIP model for computing image embeddings
@@ -524,32 +577,53 @@ monitor.summary("ViT-L/14 eager single image (GPU)")
 
 #### ViT batch throughput (eager mode)
 
-We'll test with a batch of 32 images (matching our DataLoader batch size).
+We sweep batch sizes from 32 up to 1024 to see how throughput and GPU utilization scale. We load 1024 images once and slice to each batch size for a fair comparison across sizes.
 
 
 ```python
 # runs in jupyter container on node-serve-model
+batch_sizes = [32, 64, 128, 256, 512, 1024]
 num_batches = 50
-batch_images, _ = next(iter(test_loader))
-batch_images = batch_images.to(device)
 
-# Warm-up
-with torch.no_grad():
-    clip_model.encode_image(batch_images)
+# Load 1024 images once — slice to each batch size for fair comparison
+big_loader = DataLoader(test_dataset, batch_size=max(batch_sizes), shuffle=False, num_workers=4)
+all_images, _ = next(iter(big_loader))
+all_images = all_images.to(device)
+print(f"Loaded {all_images.shape[0]} images for batch sweep")
 
-vit_batch_times_eager = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        clip_model.encode_image(batch_images)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        vit_batch_times_eager.append(time.time() - start_time)
+vit_batch_results_eager = {}
+for bs in batch_sizes:
+    batch = all_images[:bs]
 
-vit_batch_fps_eager = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_eager)
-print(f"ViT-L/14 Batch Throughput (Eager, GPU, batch_size=32): {vit_batch_fps_eager:.2f} FPS")
+    # Warm-up
+    with torch.no_grad():
+        clip_model.encode_image(batch)
+
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            clip_model.encode_image(batch)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+
+    fps = (bs * num_batches) / np.sum(times)
+    vit_batch_results_eager[bs] = {"times": times, "fps": fps,
+                                   "gpu_util": np.mean(monitor.gpu_util) if monitor.gpu_util else 0,
+                                   "gpu_mem": max(monitor.gpu_mem_used) if monitor.gpu_mem_used else 0}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.2f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.2f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU util: {vit_batch_results_eager[bs]['gpu_util']:.1f}%  "
+          f"GPU mem peak: {vit_batch_results_eager[bs]['gpu_mem']:.0f} MB")
+    monitor.summary(f"ViT-L/14 eager batch_size={bs} (GPU)")
 ```
 
 
@@ -574,6 +648,7 @@ print("Compilation complete.")
 ```python
 # runs in jupyter container on node-serve-model
 # Single-image latency (compiled)
+monitor.start()
 vit_latencies_compiled = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -584,30 +659,52 @@ with torch.no_grad():
         if device.type == "cuda":
             torch.cuda.synchronize()
         vit_latencies_compiled.append(time.time() - start_time)
+monitor.stop()
 
 print("ViT-L/14 Single Image Latency (Compiled, GPU):")
 print(f"  Median: {np.percentile(vit_latencies_compiled, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(vit_latencies_compiled, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(vit_latencies_compiled, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(vit_latencies_compiled):.2f} FPS")
+monitor.summary("ViT-L/14 compiled single image (GPU)")
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-# Batch throughput (compiled)
-vit_batch_times_compiled = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        clip_model.encode_image(batch_images)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        vit_batch_times_compiled.append(time.time() - start_time)
+# Batch throughput (compiled) — sweep same batch sizes
+vit_batch_results_compiled = {}
+for bs in batch_sizes:
+    batch = all_images[:bs]
 
-vit_batch_fps_compiled = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_compiled)
-print(f"ViT-L/14 Batch Throughput (Compiled, GPU, batch_size=32): {vit_batch_fps_compiled:.2f} FPS")
+    # Warm-up (compiled graph may recompile for new shape)
+    with torch.no_grad():
+        clip_model.encode_image(batch)
+
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            clip_model.encode_image(batch)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+
+    fps = (bs * num_batches) / np.sum(times)
+    vit_batch_results_compiled[bs] = {"times": times, "fps": fps,
+                                      "gpu_util": np.mean(monitor.gpu_util) if monitor.gpu_util else 0,
+                                      "gpu_mem": max(monitor.gpu_mem_used) if monitor.gpu_mem_used else 0}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.2f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.2f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU util: {vit_batch_results_compiled[bs]['gpu_util']:.1f}%  "
+          f"GPU mem peak: {vit_batch_results_compiled[bs]['gpu_mem']:.0f} MB")
+    monitor.summary(f"ViT-L/14 compiled batch_size={bs} (GPU)")
 ```
 
 
@@ -616,15 +713,21 @@ print(f"ViT-L/14 Batch Throughput (Compiled, GPU, batch_size=32): {vit_batch_fps
 
 ```python
 # runs in jupyter container on node-serve-model
-print("=" * 60)
+print("=" * 100)
 print("CLIP ViT-L/14 GPU Benchmark Summary")
-print("=" * 60)
-print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
-print("-" * 60)
-print(f"{'Single image latency (median, ms)':<45} {np.percentile(vit_latencies_eager, 50)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 50)*1000:>8.2f}")
-print(f"{'Single image latency (p95, ms)':<45} {np.percentile(vit_latencies_eager, 95)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 95)*1000:>8.2f}")
-print(f"{'Single image throughput (FPS)':<45} {num_trials/np.sum(vit_latencies_eager):>8.2f} {num_trials/np.sum(vit_latencies_compiled):>8.2f}")
-print(f"{'Batch throughput (FPS, batch_size=32)':<45} {vit_batch_fps_eager:>8.2f} {vit_batch_fps_compiled:>8.2f}")
+print("=" * 100)
+print(f"{'Metric':<45} {'Eager':>10} {'Compiled':>10}")
+print("-" * 70)
+print(f"{'Single image latency (median, ms)':<45} {np.percentile(vit_latencies_eager, 50)*1000:>10.2f} {np.percentile(vit_latencies_compiled, 50)*1000:>10.2f}")
+print(f"{'Single image latency (p95, ms)':<45} {np.percentile(vit_latencies_eager, 95)*1000:>10.2f} {np.percentile(vit_latencies_compiled, 95)*1000:>10.2f}")
+print(f"{'Single image throughput (FPS)':<45} {num_trials/np.sum(vit_latencies_eager):>10.2f} {num_trials/np.sum(vit_latencies_compiled):>10.2f}")
+print()
+print(f"{'Batch size':<12} {'Eager FPS':>10} {'Compiled FPS':>13} {'Eager p50 ms':>13} {'Compiled p50 ms':>16} {'Eager mem MB':>13} {'Compiled mem MB':>16}")
+print("-" * 100)
+for bs in batch_sizes:
+    e = vit_batch_results_eager[bs]
+    c = vit_batch_results_compiled[bs]
+    print(f"{bs:<12} {e['fps']:>10.1f} {c['fps']:>13.1f} {np.percentile(e['times'], 50)*1000:>13.2f} {np.percentile(c['times'], 50)*1000:>16.2f} {e['gpu_mem']:>13.0f} {c['gpu_mem']:>16.0f}")
 ```
 
 
@@ -641,7 +744,9 @@ Now we'll benchmark the lightweight MLP head that maps 768-dim CLIP embeddings t
 # runs in jupyter container on node-serve-model
 # Reload CLIP (uncompiled) and MLP for clean benchmarking
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.to(device)
 model.eval()
 ```
 
@@ -845,8 +950,12 @@ The personalized model takes both a 768-dim CLIP embedding and a user index as i
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
 # Load personalized model
-personal_model_path = "models/flickr_personalized_best_inference_only.pth"
-personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model_path = "models/inference_only/flickr_personalized_best_inference_only.pth"
+_p_state = torch.load(personal_model_path, map_location=device, weights_only=False)
+_num_users = _p_state["user_embedding.weight"].shape[0]
+personal_model = PersonalizedMLP(num_users=_num_users)
+personal_model.load_state_dict(_p_state)
+personal_model.to(device)
 personal_model.eval()
 
 # Get valid user indices from the personalized manifest
@@ -1056,9 +1165,13 @@ Finally, let's measure the full pipeline: image → ViT → normalize → MLP �
 # runs in jupyter container on node-serve-model
 # Reload uncompiled models for E2E measurement
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.to(device)
 model.eval()
-personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model = PersonalizedMLP(num_users=_num_users)
+personal_model.load_state_dict(torch.load(personal_model_path, map_location=device, weights_only=False))
+personal_model.to(device)
 personal_model.eval()
 ```
 
@@ -1307,8 +1420,10 @@ global_test.head()
 ```python
 # runs in jupyter container on node-serve-model
 # Reload clean models (without compile artifacts)
-model_eval = torch.load("models/flickr_global_best_inference_only.pth",
-                        map_location=device, weights_only=False)
+model_eval = GlobalMLP()
+model_eval.load_state_dict(torch.load("models/inference_only/flickr_global_best_inference_only.pth",
+                        map_location=device, weights_only=False))
+model_eval.to(device)
 model_eval.eval()
 clip_eval, clip_pre_eval = clip.load("ViT-L/14", device=device)
 
@@ -1344,8 +1459,11 @@ seen_workers = sorted(
 user2idx = {u: i for i, u in enumerate(seen_workers)}
 
 image_root_personal = os.path.join(data_dir, "40K")
-personal_model_eval = torch.load("models/flickr_personalized_best_inference_only.pth",
+_p_eval_state = torch.load("models/inference_only/flickr_personalized_best_inference_only.pth",
                                   map_location=device, weights_only=False)
+personal_model_eval = PersonalizedMLP(num_users=_p_eval_state["user_embedding.weight"].shape[0])
+personal_model_eval.load_state_dict(_p_eval_state)
+personal_model_eval.to(device)
 personal_model_eval.eval()
 
 print(f"Personalized test set: {len(personal_test)} rows, "
@@ -1499,6 +1617,50 @@ test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'inference'), tr
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 
+```python
+# runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+
 
 
 
@@ -1507,9 +1669,11 @@ First, let's load our saved PyTorch model, and convert it to ONNX using PyTorch'
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/flickr_global_best_inference_only.pth"  
+model_path = "models/inference_only/flickr_global_best_inference_only.pth"  
 device = torch.device("cpu")
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.eval()
 
 onnx_model_path = "models/flickr_global.onnx"
 # MLP expects a 768-dim CLIP embedding as input
@@ -1842,8 +2006,12 @@ The personalized model takes two inputs: a 768-dim CLIP embedding and a user ind
 ```python
 # runs in jupyter container on node-serve-model
 # Load personalized model and get valid user indices
-personal_model_path = "models/flickr_personalized_best_inference_only.pth"
-personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model_path = "models/inference_only/flickr_personalized_best_inference_only.pth"
+_p_state = torch.load(personal_model_path, map_location=device, weights_only=False)
+_num_users = _p_state["user_embedding.weight"].shape[0]
+personal_model = PersonalizedMLP(num_users=_num_users)
+personal_model.load_state_dict(_p_state)
+personal_model.eval()
 
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
@@ -3044,6 +3212,50 @@ print("ResourceMonitor ready.")
 
 ```python
 # runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+
+```python
+# runs in jupyter container on node-serve-model
 # Load CLIP model on GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -3209,7 +3421,8 @@ Let's measure the full pipeline on GPU: image → ViT (GPU) → normalize → ML
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
 # Load MLP on CPU
-mlp_model = torch.load("models/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False)
+mlp_model = GlobalMLP()
+mlp_model.load_state_dict(torch.load("models/inference_only/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False))
 mlp_model.eval()
 
 num_trials = 50
@@ -3279,7 +3492,9 @@ We repeat the end-to-end measurement with the **PersonalizedMLP**, which takes a
 ```python
 # runs in jupyter container on node-serve-model
 # Load personalized model and prepare user indices
-personal_model = torch.load("models/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+_p_state = torch.load("models/inference_only/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+personal_model = PersonalizedMLP(num_users=_p_state["user_embedding.weight"].shape[0])
+personal_model.load_state_dict(_p_state)
 personal_model.eval()
 
 manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
