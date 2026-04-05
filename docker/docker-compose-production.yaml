@@ -47,7 +47,7 @@ services:
     command: >
       bash -c "pip install --no-cache-dir
       'clip @ git+https://github.com/openai/CLIP.git'
-      onnx==1.18.0 onnxruntime numpy psutil tritonclient[all]
+      onnx==1.18.0 onnxruntime numpy psutil 'tritonclient[all]'
       && start-notebook.sh"
 
 volumes:

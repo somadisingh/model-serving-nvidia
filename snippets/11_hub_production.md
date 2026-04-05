@@ -501,7 +501,7 @@ import tritonclient.http as httpclient
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-TRITON_URL = "triton_production:8000"
+TRITON_URL = "triton_server:8000"
 client = httpclient.InferenceServerClient(url=TRITON_URL)
 
 print(f"Server live:  {client.is_server_live()}")
@@ -535,7 +535,7 @@ import requests as _req
 def triton_gpu_stats():
     """Fetch GPU utilization and memory from Triton's Prometheus metrics endpoint."""
     try:
-        lines = _req.get("http://triton_production:8002/metrics", timeout=2).text.splitlines()
+        lines = _req.get("http://triton_server:8002/metrics", timeout=2).text.splitlines()
     except Exception as e:
         print(f"Could not reach Triton metrics endpoint: {e}")
         return
@@ -880,7 +880,7 @@ import json
 
 for model_name in ["flickr_global", "flickr_personalized"]:
     try:
-        resp = _req.get(f"http://triton_production:8000/v2/models/{model_name}/versions/1/stats", timeout=5)
+        resp = _req.get(f"http://triton_server:8000/v2/models/{model_name}/versions/1/stats", timeout=5)
         stats = resp.json()
         infer_stats = stats.get("model_stats", [{}])[0].get("inference_stats", {})
         batch_stats = stats.get("model_stats", [{}])[0].get("batch_stats", [])
