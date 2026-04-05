@@ -18,6 +18,12 @@ services:
       - ../models_triton:/models:ro
     command: ["tritonserver", "--model-repository=/models"]
 
+  triton_sdk:
+    image: nvcr.io/nvidia/tritonserver:24.10-py3-sdk
+    container_name: triton_sdk
+    network_mode: "service:triton_server"
+    entrypoint: ["sleep", "infinity"]
+
   jupyter:
     image: quay.io/jupyter/minimal-notebook:latest
     container_name: jupyter_triton

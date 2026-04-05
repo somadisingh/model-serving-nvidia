@@ -32,14 +32,22 @@ docker stop jupyter
 docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml up -d
 ```
 
-4. Get the Jupyter token:
+4. To access the Jupyter service, we will need its randomly generated secret token (which secures it from unauthorized access). Run
 
 ```bash
 # runs on node-serve-model
 docker exec jupyter_fastapi jupyter server list
 ```
 
-5. Open this notebook in the Jupyter container at `http://<FLOATING_IP>:8888`.
+and look for a line like
+
+```
+http://localhost:8888/?token=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+Paste this into a browser tab, but in place of `localhost`, substitute the floating IP assigned to your instance, to open the Jupyter notebook interface that is running *on your compute instance*.
+
+Then, in the file browser on the left side, open the "work" directory and then click on the `9_fastapi_benchmark.ipynb` notebook to continue.
 
 :::
 

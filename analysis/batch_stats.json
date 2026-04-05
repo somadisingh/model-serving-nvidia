@@ -1,0 +1,94 @@
+{
+    "model_stats": [
+        {
+            "name": "flickr_global",
+            "version": "1",
+            "last_inference": 1775350050076,
+            "inference_count": 13784,
+            "execution_count": 12947,
+            "inference_stats": {
+                "success": {
+                    "count": 13784,
+                    "ns": 6965248107
+                },
+                "fail": {
+                    "count": 0,
+                    "ns": 0
+                },
+                "queue": {
+                    "count": 13784,
+                    "ns": 2877939209
+                },
+                "compute_input": {
+                    "count": 13784,
+                    "ns": 417873024
+                },
+                "compute_infer": {
+                    "count": 13784,
+                    "ns": 3102908195
+                },
+                "compute_output": {
+                    "count": 13784,
+                    "ns": 185752264
+                },
+                "cache_hit": {
+                    "count": 0,
+                    "ns": 0
+                },
+                "cache_miss": {
+                    "count": 0,
+                    "ns": 0
+                }
+            },
+            "response_stats": {},
+            "batch_stats": [
+                {
+                    "batch_size": 1,
+                    "compute_input": {
+                        "count": 12138,
+                        "ns": 344880826
+                    },
+                    "compute_infer": {
+                        "count": 12138,
+                        "ns": 2692444468
+                    },
+                    "compute_output": {
+                        "count": 12138,
+                        "ns": 161412849
+                    }
+                },
+                {
+                    "batch_size": 2,
+                    "compute_input": {
+                        "count": 781,
+                        "ns": 34473316
+                    },
+                    "compute_infer": {
+                        "count": 781,
+                        "ns": 195388514
+                    },
+                    "compute_output": {
+                        "count": 781,
+                        "ns": 11538203
+                    }
+                },
+                {
+                    "batch_size": 3,
+                    "compute_input": {
+                        "count": 28,
+                        "ns": 1348522
+                    },
+                    "compute_infer": {
+                        "count": 28,
+                        "ns": 6562233
+                    },
+                    "compute_output": {
+                        "count": 28,
+                        "ns": 421003
+                    }
+                }
+            ],
+            "memory_usage": []
+        }
+    ]
+}

@@ -110,12 +110,58 @@ print("ResourceMonitor ready.")
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
 # Load CLIP model on GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 if device.type == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / (1024**3):.1f} GB")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB")
 
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
@@ -295,7 +341,8 @@ Let's measure the full pipeline on GPU: image → ViT (GPU) → normalize → ML
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
 # Load MLP on CPU
-mlp_model = torch.load("models/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False)
+mlp_model = GlobalMLP()
+mlp_model.load_state_dict(torch.load("models/inference_only/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False))
 mlp_model.eval()
 
 num_trials = 50
@@ -371,7 +418,11 @@ We repeat the end-to-end measurement with the **PersonalizedMLP**, which takes a
 ```python
 # runs in jupyter container on node-serve-model
 # Load personalized model and prepare user indices
-personal_model = torch.load("models/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+_p_state = torch.load("models/inference_only/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+_num_users = _p_state["user_embedding.weight"].shape[0]
+_user_dim  = _p_state["user_embedding.weight"].shape[1]
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
+personal_model.load_state_dict(_p_state)
 personal_model.eval()
 
 manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
@@ -665,7 +716,7 @@ TensorRT on Ampere GPUs may silently apply FP16 precision, which can degrade pre
 # Pre-compute all test embeddings on GPU (one-time; used for TRT quality checks below)
 print("Pre-computing test embeddings on GPU for TRT quality verification...")
 _trt_g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-_trt_test_g = _trt_g_manifest[_trt_g_manifest["split"] == "inference"].reset_index(drop=True)
+_trt_test_g = _trt_g_manifest[_trt_g_manifest["split"] == "test"].reset_index(drop=True)
 _trt_img_root = os.path.join(data_dir, "40K")
 
 _trt_g_embs_list, _trt_g_tgts = [], []
@@ -688,7 +739,7 @@ _trt_g_embs = np.concatenate(_trt_g_embs_list, axis=0)
 _trt_g_tgts = np.array(_trt_g_tgts, dtype=np.float32)
 
 _trt_p_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-_trt_test_p = _trt_p_manifest[_trt_p_manifest["split"] == "inference"].reset_index(drop=True)
+_trt_test_p = _trt_p_manifest[_trt_p_manifest["split"] == "test"].reset_index(drop=True)
 _trt_seen_w = sorted(_trt_p_manifest.loc[_trt_p_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
 _trt_user2idx = {u: i for i, u in enumerate(_trt_seen_w)}
 
@@ -768,6 +819,13 @@ print(f"  Binary accuracy:  {_trt_acc:.4f}  (threshold=0.5)")
 print(f"  AUC-ROC:          {_trt_auc:.4f}")
 print("Compare with FP32 CUDA EP metrics: any drop indicates TF32/FP16 precision trade-off.")
 print("(On Ampere/A100, TRT defaults to TF32 for matmuls; FP16 requires explicit trt_fp16_enable=True.)")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - TensorRT execution provider
 personal_onnx_path = "models/flickr_personalized.onnx"
 monitor.start()
 ort_session = ort.InferenceSession(personal_onnx_path, providers=['TensorrtExecutionProvider'])
@@ -800,6 +858,8 @@ print(f"  Mean per-user SRCC: {np.mean(_trt_per_srcc):.4f}")
 print(f"  Mean per-user MAE:  {np.mean(_trt_per_mae):.4f}")
 print("Compare with FP32 CUDA EP metrics: any drop indicates TF32/FP16 precision trade-off.")
 print("(On Ampere/A100, TRT defaults to TF32 for matmuls; FP16 requires explicit trt_fp16_enable=True.)")
+```
+:::
 
 
 ::: {.cell .markdown} 

@@ -38,14 +38,20 @@ docker logs triton_server 2>&1 | tail -5
 
 You should see `Started GRPCInferenceService` and `Started HTTPService`.
 
-5. Get the Jupyter token:
+5. To access the Jupyter service, we will need its randomly generated secret token (which secures it from unauthorized access). Run
 
 ```bash
 # runs on node-serve-model
 docker exec jupyter_triton jupyter server list
 ```
 
-6. Open this notebook at `http://<FLOATING_IP>:8888`.
+   and look for a line like
+
+       http://localhost:8888/?token=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+   Paste this into a browser tab, but in place of `localhost`, substitute the floating IP assigned to your instance, to open the Jupyter notebook interface that is running *on your compute instance*.
+
+   Then, in the file browser on the left side, open the "work" directory and then click on the `10_triton_benchmark.ipynb` notebook to continue.
 
 :::
 
@@ -399,32 +405,23 @@ print(f"  Throughput:           {pb_throughput:.2f} samples/s")
 
 ## Part 4: `perf_analyzer` Benchmarks
 
-Triton ships `perf_analyzer` inside its container. We can run it from the host or install it in another container. For convenience, we'll run it from the Jupyter container.
+`perf_analyzer` is Triton's official load-testing CLI. It lives in the **SDK image** (`tritonserver:24.10-py3-sdk`), not the server image, so the compose file includes a lightweight `triton_sdk` sidecar container that shares the server's network namespace.
 
-Note: `perf_analyzer` generates synthetic input data matching the model's input shape.
-
-### Install perf_analyzer
-
-If `perf_analyzer` is not already available in your Jupyter container, run it from the Triton container instead:
-
-```bash
-# runs on node-serve-model
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --concurrency-range 1
-```
+The tool generates synthetic input tensors matching the model's input shape, fires them at the server, and reports precise latency breakdowns (queue time, compute time) and throughput.
 
 ### Concurrency sweep — Global MLP
 
-Run these commands from the **host** (or from inside the Triton container):
+Run these commands on the **host** (SSH into `node-serve-model`):
 
 ```bash
 # Concurrency = 1 (baseline)
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 1
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 1
 
 # Concurrency = 8
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
 
 # Concurrency = 16
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 16
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 16
 ```
 
 Record the **average request latency** and its breakdown:
@@ -450,11 +447,11 @@ Record the **average request latency** and its breakdown:
 Test different batch sizes with a single concurrent client:
 
 ```bash
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1  --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 8  --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 16 --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 32 --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 64 --shape input:768 --concurrency-range 1
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1  --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 8  --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 16 --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 32 --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 64 --shape input:768 --concurrency-range 1 --measurement-interval 10000
 ```
 
 :::
@@ -515,7 +512,7 @@ docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up tr
 
 Wait for it to be ready, then benchmark:
 ```bash
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
 ```
 
 Compare queue delay and throughput vs the single-instance case.
@@ -558,13 +555,13 @@ Restart Triton, then test with Poisson arrivals at various request rates:
 
 ```bash
 # Without dynamic batching (comment it out first for comparison)
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
 
 # With dynamic batching
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
 
 # Higher request rate with dynamic batching
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 500 --request-distribution poisson
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 500 --request-distribution poisson
 ```
 
 Check batch statistics:

@@ -61,6 +61,52 @@ test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers
 ```
 :::
 
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+:::
+
 
 
 ::: {.cell .markdown}
@@ -72,9 +118,11 @@ First, let's load our saved PyTorch model, and convert it to ONNX using PyTorch'
 ::: {.cell .code}
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/flickr_global_best_inference_only.pth"  
+model_path = "models/inference_only/flickr_global_best_inference_only.pth"  
 device = torch.device("cpu")
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.eval()
 
 onnx_model_path = "models/flickr_global.onnx"
 # MLP expects a 768-dim CLIP embedding as input
@@ -310,7 +358,7 @@ These metrics show how well the **FP32 ONNX model** predicts aesthetic scores on
 # runs in jupyter container on node-serve-model
 # Quality metrics: full test split — Global FP32 ONNX baseline
 global_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-test_g_q = global_manifest_q[global_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_g_q = global_manifest_q[global_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_q = os.path.join(data_dir, "40K")
 print(f"Test set: {len(test_g_q)} images — running CLIP encoding + ONNX inference...")
 print("(GPU CLIP encoding — should complete in 1-3 minutes.)")
@@ -451,8 +499,13 @@ The personalized model takes two inputs: a 768-dim CLIP embedding and a user ind
 ```python
 # runs in jupyter container on node-serve-model
 # Load personalized model and get valid user indices
-personal_model_path = "models/flickr_personalized_best_inference_only.pth"
-personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model_path = "models/inference_only/flickr_personalized_best_inference_only.pth"
+_p_state = torch.load(personal_model_path, map_location=device, weights_only=False)
+_num_users = _p_state["user_embedding.weight"].shape[0]
+_user_dim = _p_state["user_embedding.weight"].shape[1]
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
+personal_model.load_state_dict(_p_state)
+personal_model.eval()
 
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
@@ -672,7 +725,7 @@ Per-user SRCC and MAE across every annotator in the test split.
 # runs in jupyter container on node-serve-model
 # Quality metrics: Personalized FP32 ONNX — per-user SRCC and MAE
 p_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-test_p_q = p_manifest_q[p_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_p_q = p_manifest_q[p_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_p = os.path.join(data_dir, "40K")
 input_names_p = [i.name for i in personal_ort_session.get_inputs()]
 test_workers_q = [w for w in test_p_q["worker_id"].unique() if w in user2idx]

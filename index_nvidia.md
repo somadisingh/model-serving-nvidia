@@ -424,15 +424,68 @@ print("ResourceMonitor ready.")
 
 
 
+### Model architecture definitions
+
+The `.pth` files contain saved state dicts (model weights only). We need to define the same architectures used during training before loading the weights.
+
+
+```python
+# runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+
+
+
 First, let's load our MLP head and the CLIP ViT-L/14 model (used to compute image embeddings). We run all inference on the **GPU** — the A100's tensor cores make ViT encoding orders of magnitude faster than CPU.
 
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/flickr_global_best_inference_only.pth"  
+model_path = "models/inference_only/flickr_global_best_inference_only.pth"  
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.to(device)
 model.eval()
 
 # Load CLIP model for computing image embeddings
@@ -524,32 +577,56 @@ monitor.summary("ViT-L/14 eager single image (GPU)")
 
 #### ViT batch throughput (eager mode)
 
-We'll test with a batch of 32 images (matching our DataLoader batch size).
+We sweep batch sizes from 32 up to 1024 to see how throughput and GPU utilization scale. We load 1024 images once and slice to each batch size for a fair comparison across sizes.
 
 
 ```python
 # runs in jupyter container on node-serve-model
+batch_sizes = [32, 64, 128, 256, 512, 1024]
 num_batches = 50
-batch_images, _ = next(iter(test_loader))
-batch_images = batch_images.to(device)
 
-# Warm-up
-with torch.no_grad():
-    clip_model.encode_image(batch_images)
+# Load 1024 images once — slice to each batch size for fair comparison
+big_loader = DataLoader(test_dataset, batch_size=max(batch_sizes), shuffle=False, num_workers=4)
+all_images, _ = next(iter(big_loader))
+all_images = all_images.to(device)
+print(f"Loaded {all_images.shape[0]} images for batch sweep")
 
-vit_batch_times_eager = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        clip_model.encode_image(batch_images)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        vit_batch_times_eager.append(time.time() - start_time)
+vit_batch_results_eager = {}
+for bs in batch_sizes:
+    batch = all_images[:bs]
 
-vit_batch_fps_eager = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_eager)
-print(f"ViT-L/14 Batch Throughput (Eager, GPU, batch_size=32): {vit_batch_fps_eager:.2f} FPS")
+    # Warm-up
+    with torch.no_grad():
+        clip_model.encode_image(batch)
+
+    # Reset PyTorch peak memory counter for accurate per-batch tracking
+    torch.cuda.reset_peak_memory_stats()
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            clip_model.encode_image(batch)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+    fps = (bs * num_batches) / np.sum(times)
+    vit_batch_results_eager[bs] = {"times": times, "fps": fps,
+                                   "gpu_util": np.mean(monitor.gpu_util) if monitor.gpu_util else 0,
+                                   "gpu_mem": peak_mem_mb}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.2f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.2f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU util: {vit_batch_results_eager[bs]['gpu_util']:.1f}%  "
+          f"GPU mem peak: {peak_mem_mb:.0f} MB")
+    monitor.summary(f"ViT-L/14 eager batch_size={bs} (GPU)")
 ```
 
 
@@ -574,6 +651,7 @@ print("Compilation complete.")
 ```python
 # runs in jupyter container on node-serve-model
 # Single-image latency (compiled)
+monitor.start()
 vit_latencies_compiled = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -584,30 +662,55 @@ with torch.no_grad():
         if device.type == "cuda":
             torch.cuda.synchronize()
         vit_latencies_compiled.append(time.time() - start_time)
+monitor.stop()
 
 print("ViT-L/14 Single Image Latency (Compiled, GPU):")
 print(f"  Median: {np.percentile(vit_latencies_compiled, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(vit_latencies_compiled, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(vit_latencies_compiled, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials / np.sum(vit_latencies_compiled):.2f} FPS")
+monitor.summary("ViT-L/14 compiled single image (GPU)")
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-# Batch throughput (compiled)
-vit_batch_times_compiled = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        clip_model.encode_image(batch_images)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        vit_batch_times_compiled.append(time.time() - start_time)
+# Batch throughput (compiled) — sweep same batch sizes
+vit_batch_results_compiled = {}
+for bs in batch_sizes:
+    batch = all_images[:bs]
 
-vit_batch_fps_compiled = (batch_images.shape[0] * num_batches) / np.sum(vit_batch_times_compiled)
-print(f"ViT-L/14 Batch Throughput (Compiled, GPU, batch_size=32): {vit_batch_fps_compiled:.2f} FPS")
+    # Warm-up (compiled graph may recompile for new shape)
+    with torch.no_grad():
+        clip_model.encode_image(batch)
+
+    # Reset PyTorch peak memory counter for accurate per-batch tracking
+    torch.cuda.reset_peak_memory_stats()
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            clip_model.encode_image(batch)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+    fps = (bs * num_batches) / np.sum(times)
+    vit_batch_results_compiled[bs] = {"times": times, "fps": fps,
+                                      "gpu_util": np.mean(monitor.gpu_util) if monitor.gpu_util else 0,
+                                      "gpu_mem": peak_mem_mb}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.2f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.2f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU util: {vit_batch_results_compiled[bs]['gpu_util']:.1f}%  "
+          f"GPU mem peak: {peak_mem_mb:.0f} MB")
+    monitor.summary(f"ViT-L/14 compiled batch_size={bs} (GPU)")
 ```
 
 
@@ -616,15 +719,21 @@ print(f"ViT-L/14 Batch Throughput (Compiled, GPU, batch_size=32): {vit_batch_fps
 
 ```python
 # runs in jupyter container on node-serve-model
-print("=" * 60)
+print("=" * 100)
 print("CLIP ViT-L/14 GPU Benchmark Summary")
-print("=" * 60)
-print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
-print("-" * 60)
-print(f"{'Single image latency (median, ms)':<45} {np.percentile(vit_latencies_eager, 50)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 50)*1000:>8.2f}")
-print(f"{'Single image latency (p95, ms)':<45} {np.percentile(vit_latencies_eager, 95)*1000:>8.2f} {np.percentile(vit_latencies_compiled, 95)*1000:>8.2f}")
-print(f"{'Single image throughput (FPS)':<45} {num_trials/np.sum(vit_latencies_eager):>8.2f} {num_trials/np.sum(vit_latencies_compiled):>8.2f}")
-print(f"{'Batch throughput (FPS, batch_size=32)':<45} {vit_batch_fps_eager:>8.2f} {vit_batch_fps_compiled:>8.2f}")
+print("=" * 100)
+print(f"{'Metric':<45} {'Eager':>10} {'Compiled':>10}")
+print("-" * 70)
+print(f"{'Single image latency (median, ms)':<45} {np.percentile(vit_latencies_eager, 50)*1000:>10.2f} {np.percentile(vit_latencies_compiled, 50)*1000:>10.2f}")
+print(f"{'Single image latency (p95, ms)':<45} {np.percentile(vit_latencies_eager, 95)*1000:>10.2f} {np.percentile(vit_latencies_compiled, 95)*1000:>10.2f}")
+print(f"{'Single image throughput (FPS)':<45} {num_trials/np.sum(vit_latencies_eager):>10.2f} {num_trials/np.sum(vit_latencies_compiled):>10.2f}")
+print()
+print(f"{'Batch size':<12} {'Eager FPS':>10} {'Compiled FPS':>13} {'Eager p50 ms':>13} {'Compiled p50 ms':>16} {'Eager mem MB':>13} {'Compiled mem MB':>16}")
+print("-" * 100)
+for bs in batch_sizes:
+    e = vit_batch_results_eager[bs]
+    c = vit_batch_results_compiled[bs]
+    print(f"{bs:<12} {e['fps']:>10.1f} {c['fps']:>13.1f} {np.percentile(e['times'], 50)*1000:>13.2f} {np.percentile(c['times'], 50)*1000:>16.2f} {e['gpu_mem']:>13.0f} {c['gpu_mem']:>16.0f}")
 ```
 
 
@@ -639,9 +748,15 @@ Now we'll benchmark the lightweight MLP head that maps 768-dim CLIP embeddings t
 
 ```python
 # runs in jupyter container on node-serve-model
+# Free ViT batch data and release cached GPU memory before MLP benchmarks
+if 'all_images' in dir(): del all_images
+torch.cuda.empty_cache()
+
 # Reload CLIP (uncompiled) and MLP for clean benchmarking
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.to(device)
 model.eval()
 ```
 
@@ -702,6 +817,8 @@ with torch.no_grad():
 with torch.no_grad():
     model(single_embedding)
 
+torch.cuda.reset_peak_memory_stats()
+monitor.start()
 mlp_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -712,6 +829,8 @@ with torch.no_grad():
         if device.type == "cuda":
             torch.cuda.synchronize()
         mlp_latencies_eager.append(time.time() - start_time)
+monitor.stop()
+mlp_eager_single_mem_mb = torch.cuda.max_memory_allocated() / 1e6
 ```
 
 ```python
@@ -721,39 +840,61 @@ print(f"  Median: {np.percentile(mlp_latencies_eager, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(mlp_latencies_eager, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(mlp_latencies_eager, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials/np.sum(mlp_latencies_eager):.2f} FPS")
+print(f"  GPU mem peak (PyTorch): {mlp_eager_single_mem_mb:.0f} MB")
+monitor.summary("MLP eager single sample (GPU)")
 ```
 
 
 #### MLP batch throughput (eager mode)
 
+We sweep the same batch sizes as ViT to see how the lightweight MLP scales. We pre-compute 1024 CLIP embeddings once and slice to each batch size.
+
 
 ```python
 # runs in jupyter container on node-serve-model
+mlp_batch_sizes = [32, 64, 128, 256, 512, 1024]
 num_batches = 50
 
-# Pre-compute a batch of CLIP embeddings for benchmarking MLP throughput
+# Pre-compute 1024 CLIP embeddings once — slice to each batch size
 with torch.no_grad():
-    batch_images, _ = next(iter(test_loader))
-    batch_features = clip_model.encode_image(batch_images.to(device))
-    batch_embeddings = torch.from_numpy(normalized(batch_features.cpu().numpy())).float().to(device)
+    big_emb_loader = DataLoader(test_dataset, batch_size=max(mlp_batch_sizes), shuffle=False, num_workers=4)
+    big_images, _ = next(iter(big_emb_loader))
+    big_features = clip_model.encode_image(big_images.to(device))
+    all_embeddings = torch.from_numpy(normalized(big_features.cpu().numpy())).float().to(device)
+print(f"Pre-computed {all_embeddings.shape[0]} embeddings for MLP batch sweep")
 
-# Warm-up run 
-with torch.no_grad():
-    model(batch_embeddings)
+mlp_batch_results_eager = {}
+for bs in mlp_batch_sizes:
+    batch_embeddings = all_embeddings[:bs]
 
-mlp_batch_times_eager = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        _ = model(batch_embeddings)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        mlp_batch_times_eager.append(time.time() - start_time)
+    # Warm-up
+    with torch.no_grad():
+        model(batch_embeddings)
 
-mlp_batch_fps_eager = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_eager)
-print(f"MLP Batch Throughput (Eager, GPU, batch_size=32): {mlp_batch_fps_eager:.2f} FPS")
+    torch.cuda.reset_peak_memory_stats()
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            _ = model(batch_embeddings)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+    fps = (bs * num_batches) / np.sum(times)
+    mlp_batch_results_eager[bs] = {"times": times, "fps": fps, "gpu_mem": peak_mem_mb}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.4f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.4f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU mem peak: {peak_mem_mb:.0f} MB")
+    monitor.summary(f"MLP eager batch_size={bs} (GPU)")
 ```
 
 
@@ -774,6 +915,8 @@ print("Compilation complete.")
 
 ```python
 # runs in jupyter container on node-serve-model
+torch.cuda.reset_peak_memory_stats()
+monitor.start()
 mlp_latencies_compiled = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -784,29 +927,53 @@ with torch.no_grad():
         if device.type == "cuda":
             torch.cuda.synchronize()
         mlp_latencies_compiled.append(time.time() - start_time)
+monitor.stop()
+mlp_compiled_single_mem_mb = torch.cuda.max_memory_allocated() / 1e6
 
 print("MLP Single Sample Latency (Compiled, GPU):")
 print(f"  Median: {np.percentile(mlp_latencies_compiled, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(mlp_latencies_compiled, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(mlp_latencies_compiled, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials/np.sum(mlp_latencies_compiled):.2f} FPS")
+print(f"  GPU mem peak (PyTorch): {mlp_compiled_single_mem_mb:.0f} MB")
+monitor.summary("MLP compiled single sample (GPU)")
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-mlp_batch_times_compiled = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        _ = model(batch_embeddings)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        mlp_batch_times_compiled.append(time.time() - start_time)
+# Batch throughput (compiled) — sweep same batch sizes
+mlp_batch_results_compiled = {}
+for bs in mlp_batch_sizes:
+    batch_embeddings = all_embeddings[:bs]
 
-mlp_batch_fps_compiled = (batch_embeddings.shape[0] * num_batches) / np.sum(mlp_batch_times_compiled)
-print(f"MLP Batch Throughput (Compiled, GPU, batch_size=32): {mlp_batch_fps_compiled:.2f} FPS")
+    # Warm-up (compiled graph may recompile for new shape)
+    with torch.no_grad():
+        model(batch_embeddings)
+
+    torch.cuda.reset_peak_memory_stats()
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            _ = model(batch_embeddings)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+    fps = (bs * num_batches) / np.sum(times)
+    mlp_batch_results_compiled[bs] = {"times": times, "fps": fps, "gpu_mem": peak_mem_mb}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.4f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.4f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU mem peak: {peak_mem_mb:.0f} MB")
+    monitor.summary(f"MLP compiled batch_size={bs} (GPU)")
 ```
 
 
@@ -816,18 +983,24 @@ print(f"MLP Batch Throughput (Compiled, GPU, batch_size=32): {mlp_batch_fps_comp
 
 ```python
 # runs in jupyter container on node-serve-model
-print("=" * 60)
+print("=" * 90)
 print("Aesthetic MLP Head GPU Benchmark Summary")
-print("=" * 60)
+print("=" * 90)
 print(f"MLP Model Size on Disk: {mlp_model_size / (1e6):.2f} MB")
 print(f"Mean Predicted Score: {mean_score:.2f} (std: {std_score:.2f})")
 print()
 print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
-print("-" * 60)
-print(f"{'Single sample latency (median, ms)':<45} {np.percentile(mlp_latencies_eager, 50)*1000:>8.2f} {np.percentile(mlp_latencies_compiled, 50)*1000:>8.2f}")
-print(f"{'Single sample latency (p95, ms)':<45} {np.percentile(mlp_latencies_eager, 95)*1000:>8.2f} {np.percentile(mlp_latencies_compiled, 95)*1000:>8.2f}")
+print("-" * 65)
+print(f"{'Single sample latency (median, ms)':<45} {np.percentile(mlp_latencies_eager, 50)*1000:>8.4f} {np.percentile(mlp_latencies_compiled, 50)*1000:>8.4f}")
+print(f"{'Single sample latency (p95, ms)':<45} {np.percentile(mlp_latencies_eager, 95)*1000:>8.4f} {np.percentile(mlp_latencies_compiled, 95)*1000:>8.4f}")
 print(f"{'Single sample throughput (FPS)':<45} {num_trials/np.sum(mlp_latencies_eager):>8.2f} {num_trials/np.sum(mlp_latencies_compiled):>8.2f}")
-print(f"{'Batch throughput (FPS, batch_size=32)':<45} {mlp_batch_fps_eager:>8.2f} {mlp_batch_fps_compiled:>8.2f}")
+print()
+print(f"{'Batch size':<12} {'Eager FPS':>10} {'Compiled FPS':>13} {'Eager p50 ms':>13} {'Compiled p50 ms':>16} {'Eager mem MB':>13} {'Compiled mem MB':>16}")
+print("-" * 100)
+for bs in mlp_batch_sizes:
+    e = mlp_batch_results_eager[bs]
+    c = mlp_batch_results_compiled[bs]
+    print(f"{bs:<12} {e['fps']:>10.1f} {c['fps']:>13.1f} {np.percentile(e['times'], 50)*1000:>13.4f} {np.percentile(c['times'], 50)*1000:>16.4f} {e['gpu_mem']:>13.0f} {c['gpu_mem']:>16.0f}")
 ```
 
 
@@ -841,12 +1014,21 @@ The personalized model takes both a 768-dim CLIP embedding and a user index as i
 
 ```python
 # runs in jupyter container on node-serve-model
+# Free Global MLP batch data and release cached GPU memory
+if 'all_embeddings' in dir(): del all_embeddings
+torch.cuda.empty_cache()
+
 # Reload CLIP (uncompiled) for clean benchmarking
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
 # Load personalized model
-personal_model_path = "models/flickr_personalized_best_inference_only.pth"
-personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model_path = "models/inference_only/flickr_personalized_best_inference_only.pth"
+_p_state = torch.load(personal_model_path, map_location=device, weights_only=False)
+_num_users = _p_state["user_embedding.weight"].shape[0]
+_user_dim = _p_state["user_embedding.weight"].shape[1]
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
+personal_model.load_state_dict(_p_state)
+personal_model.to(device)
 personal_model.eval()
 
 # Get valid user indices from the personalized manifest
@@ -913,6 +1095,8 @@ with torch.no_grad():
 with torch.no_grad():
     personal_model(p_single_embedding, p_single_user_idx)
 
+torch.cuda.reset_peak_memory_stats()
+monitor.start()
 personal_mlp_latencies_eager = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -923,6 +1107,8 @@ with torch.no_grad():
         if device.type == "cuda":
             torch.cuda.synchronize()
         personal_mlp_latencies_eager.append(time.time() - start_time)
+monitor.stop()
+personal_mlp_eager_single_mem_mb = torch.cuda.max_memory_allocated() / 1e6
 ```
 
 ```python
@@ -932,41 +1118,63 @@ print(f"  Median: {np.percentile(personal_mlp_latencies_eager, 50) * 1000:.2f} m
 print(f"  95th percentile: {np.percentile(personal_mlp_latencies_eager, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(personal_mlp_latencies_eager, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials/np.sum(personal_mlp_latencies_eager):.2f} FPS")
+print(f"  GPU mem peak (PyTorch): {personal_mlp_eager_single_mem_mb:.0f} MB")
+monitor.summary("Personalized MLP eager single sample (GPU)")
 ```
 
 
 
 #### Personalized MLP batch throughput (eager mode)
 
+We sweep the same batch sizes as the Global MLP to see how the personalized model scales. We pre-compute 1024 CLIP embeddings once and slice to each batch size.
+
 
 ```python
 # runs in jupyter container on node-serve-model
+personal_mlp_batch_sizes = [32, 64, 128, 256, 512, 1024]
 num_batches = 50
 
-# Pre-compute batch of CLIP embeddings
+# Pre-compute 1024 CLIP embeddings once — slice to each batch size
 with torch.no_grad():
-    batch_images, _ = next(iter(test_loader))
-    batch_features = clip_model.encode_image(batch_images.to(device))
-    p_batch_embeddings = torch.from_numpy(normalized(batch_features.cpu().numpy())).float().to(device)
-    p_batch_user_idx = torch.zeros(p_batch_embeddings.shape[0], dtype=torch.long, device=device)
+    p_big_emb_loader = DataLoader(test_dataset, batch_size=max(personal_mlp_batch_sizes), shuffle=False, num_workers=4)
+    p_big_images, _ = next(iter(p_big_emb_loader))
+    p_big_features = clip_model.encode_image(p_big_images.to(device))
+    p_all_embeddings = torch.from_numpy(normalized(p_big_features.cpu().numpy())).float().to(device)
+print(f"Pre-computed {p_all_embeddings.shape[0]} embeddings for Personalized MLP batch sweep")
 
-# Warm-up run
-with torch.no_grad():
-    personal_model(p_batch_embeddings, p_batch_user_idx)
+personal_mlp_batch_results_eager = {}
+for bs in personal_mlp_batch_sizes:
+    batch_embeddings = p_all_embeddings[:bs]
+    batch_user_idx = torch.zeros(bs, dtype=torch.long, device=device)
 
-personal_mlp_batch_times_eager = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        _ = personal_model(p_batch_embeddings, p_batch_user_idx)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        personal_mlp_batch_times_eager.append(time.time() - start_time)
+    # Warm-up
+    with torch.no_grad():
+        personal_model(batch_embeddings, batch_user_idx)
 
-personal_mlp_batch_fps_eager = (p_batch_embeddings.shape[0] * num_batches) / np.sum(personal_mlp_batch_times_eager)
-print(f"Personalized MLP Batch Throughput (Eager, GPU, batch_size=32): {personal_mlp_batch_fps_eager:.2f} FPS")
+    torch.cuda.reset_peak_memory_stats()
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            _ = personal_model(batch_embeddings, batch_user_idx)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+    fps = (bs * num_batches) / np.sum(times)
+    personal_mlp_batch_results_eager[bs] = {"times": times, "fps": fps, "gpu_mem": peak_mem_mb}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.4f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.4f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU mem peak: {peak_mem_mb:.0f} MB")
+    monitor.summary(f"Personalized MLP eager batch_size={bs} (GPU)")
 ```
 
 
@@ -987,6 +1195,8 @@ print("Compilation complete.")
 
 ```python
 # runs in jupyter container on node-serve-model
+torch.cuda.reset_peak_memory_stats()
+monitor.start()
 personal_mlp_latencies_compiled = []
 with torch.no_grad():
     for _ in range(num_trials):
@@ -997,29 +1207,54 @@ with torch.no_grad():
         if device.type == "cuda":
             torch.cuda.synchronize()
         personal_mlp_latencies_compiled.append(time.time() - start_time)
+monitor.stop()
+personal_mlp_compiled_single_mem_mb = torch.cuda.max_memory_allocated() / 1e6
 
 print("Personalized MLP Single Sample Latency (Compiled, GPU):")
 print(f"  Median: {np.percentile(personal_mlp_latencies_compiled, 50) * 1000:.2f} ms")
 print(f"  95th percentile: {np.percentile(personal_mlp_latencies_compiled, 95) * 1000:.2f} ms")
 print(f"  99th percentile: {np.percentile(personal_mlp_latencies_compiled, 99) * 1000:.2f} ms")
 print(f"  Throughput: {num_trials/np.sum(personal_mlp_latencies_compiled):.2f} FPS")
+print(f"  GPU mem peak (PyTorch): {personal_mlp_compiled_single_mem_mb:.0f} MB")
+monitor.summary("Personalized MLP compiled single sample (GPU)")
 ```
 
 ```python
 # runs in jupyter container on node-serve-model
-personal_mlp_batch_times_compiled = []
-with torch.no_grad():
-    for _ in range(num_batches):
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        start_time = time.time()
-        _ = personal_model(p_batch_embeddings, p_batch_user_idx)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        personal_mlp_batch_times_compiled.append(time.time() - start_time)
+# Batch throughput (compiled) — sweep same batch sizes
+personal_mlp_batch_results_compiled = {}
+for bs in personal_mlp_batch_sizes:
+    batch_embeddings = p_all_embeddings[:bs]
+    batch_user_idx = torch.zeros(bs, dtype=torch.long, device=device)
 
-personal_mlp_batch_fps_compiled = (p_batch_embeddings.shape[0] * num_batches) / np.sum(personal_mlp_batch_times_compiled)
-print(f"Personalized MLP Batch Throughput (Compiled, GPU, batch_size=32): {personal_mlp_batch_fps_compiled:.2f} FPS")
+    # Warm-up (compiled graph may recompile for new shape)
+    with torch.no_grad():
+        personal_model(batch_embeddings, batch_user_idx)
+
+    torch.cuda.reset_peak_memory_stats()
+    monitor.start()
+    times = []
+    with torch.no_grad():
+        for _ in range(num_batches):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            start_time = time.time()
+            _ = personal_model(batch_embeddings, batch_user_idx)
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            times.append(time.time() - start_time)
+    monitor.stop()
+    peak_mem_mb = torch.cuda.max_memory_allocated() / 1e6
+
+    fps = (bs * num_batches) / np.sum(times)
+    personal_mlp_batch_results_compiled[bs] = {"times": times, "fps": fps, "gpu_mem": peak_mem_mb}
+
+    print(f"\nbatch_size={bs}:")
+    print(f"  Median: {np.percentile(times, 50) * 1000:.4f} ms")
+    print(f"  95th percentile: {np.percentile(times, 95) * 1000:.4f} ms")
+    print(f"  Throughput: {fps:.2f} FPS")
+    print(f"  GPU mem peak: {peak_mem_mb:.0f} MB")
+    monitor.summary(f"Personalized MLP compiled batch_size={bs} (GPU)")
 ```
 
 
@@ -1029,17 +1264,23 @@ print(f"Personalized MLP Batch Throughput (Compiled, GPU, batch_size=32): {perso
 
 ```python
 # runs in jupyter container on node-serve-model
-print("=" * 65)
+print("=" * 100)
 print("Personalized MLP Head GPU Benchmark Summary")
-print("=" * 65)
+print("=" * 100)
 print(f"Personalized MLP Model Size on Disk: {personal_mlp_model_size / (1e6):.2f} MB")
 print()
 print(f"{'Metric':<45} {'Eager':>8} {'Compiled':>8}")
 print("-" * 65)
-print(f"{'Single sample latency (median, ms)':<45} {np.percentile(personal_mlp_latencies_eager, 50)*1000:>8.2f} {np.percentile(personal_mlp_latencies_compiled, 50)*1000:>8.2f}")
-print(f"{'Single sample latency (p95, ms)':<45} {np.percentile(personal_mlp_latencies_eager, 95)*1000:>8.2f} {np.percentile(personal_mlp_latencies_compiled, 95)*1000:>8.2f}")
+print(f"{'Single sample latency (median, ms)':<45} {np.percentile(personal_mlp_latencies_eager, 50)*1000:>8.4f} {np.percentile(personal_mlp_latencies_compiled, 50)*1000:>8.4f}")
+print(f"{'Single sample latency (p95, ms)':<45} {np.percentile(personal_mlp_latencies_eager, 95)*1000:>8.4f} {np.percentile(personal_mlp_latencies_compiled, 95)*1000:>8.4f}")
 print(f"{'Single sample throughput (FPS)':<45} {num_trials/np.sum(personal_mlp_latencies_eager):>8.2f} {num_trials/np.sum(personal_mlp_latencies_compiled):>8.2f}")
-print(f"{'Batch throughput (FPS, batch_size=32)':<45} {personal_mlp_batch_fps_eager:>8.2f} {personal_mlp_batch_fps_compiled:>8.2f}")
+print()
+print(f"{'Batch size':<12} {'Eager FPS':>10} {'Compiled FPS':>13} {'Eager p50 ms':>13} {'Compiled p50 ms':>16} {'Eager mem MB':>13} {'Compiled mem MB':>16}")
+print("-" * 100)
+for bs in personal_mlp_batch_sizes:
+    e = personal_mlp_batch_results_eager[bs]
+    c = personal_mlp_batch_results_compiled[bs]
+    print(f"{bs:<12} {e['fps']:>10.1f} {c['fps']:>13.1f} {np.percentile(e['times'], 50)*1000:>13.4f} {np.percentile(c['times'], 50)*1000:>16.4f} {e['gpu_mem']:>13.0f} {c['gpu_mem']:>16.0f}")
 ```
 
 
@@ -1054,12 +1295,21 @@ Finally, let's measure the full pipeline: image → ViT → normalize → MLP �
 
 ```python
 # runs in jupyter container on node-serve-model
+# Free Personalized MLP batch data and release cached GPU memory
+if 'p_all_embeddings' in dir(): del p_all_embeddings
+torch.cuda.empty_cache()
+
 # Reload uncompiled models for E2E measurement
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.to(device)
 model.eval()
-personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
+personal_model.load_state_dict(torch.load(personal_model_path, map_location=device, weights_only=False))
+personal_model.to(device)
 personal_model.eval()
+print("Models reloaded (uncompiled) for E2E benchmarking.")
 ```
 
 ```python
@@ -1296,8 +1546,8 @@ Load the test split from `flickr_global_manifest.csv` and run inference over all
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 global_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
 
-# Use only the inference (test) split
-global_test = global_manifest[global_manifest["split"] == "inference"].copy()
+# Use only the test split
+global_test = global_manifest[global_manifest["split"] == "test"].copy()
 image_root_global = os.path.join(data_dir, "40K")
 
 print(f"Global test set: {len(global_test)} images")
@@ -1307,8 +1557,10 @@ global_test.head()
 ```python
 # runs in jupyter container on node-serve-model
 # Reload clean models (without compile artifacts)
-model_eval = torch.load("models/flickr_global_best_inference_only.pth",
-                        map_location=device, weights_only=False)
+model_eval = GlobalMLP()
+model_eval.load_state_dict(torch.load("models/inference_only/flickr_global_best_inference_only.pth",
+                        map_location=device, weights_only=False))
+model_eval.to(device)
 model_eval.eval()
 clip_eval, clip_pre_eval = clip.load("ViT-L/14", device=device)
 
@@ -1331,8 +1583,8 @@ We also compute **personalization gain**: how much the personalized model improv
 # runs in jupyter container on node-serve-model
 personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
 
-# Use only the inference split
-personal_test = personal_manifest[personal_manifest["split"] == "inference"].copy()
+# Use only the test split
+personal_test = personal_manifest[personal_manifest["split"] == "test"].copy()
 
 # Use worker_score_norm as ground truth (already in [0,1])
 personal_test = personal_test.rename(columns={"worker_score_norm": "global_score"})
@@ -1344,8 +1596,12 @@ seen_workers = sorted(
 user2idx = {u: i for i, u in enumerate(seen_workers)}
 
 image_root_personal = os.path.join(data_dir, "40K")
-personal_model_eval = torch.load("models/flickr_personalized_best_inference_only.pth",
+_p_eval_state = torch.load("models/inference_only/flickr_personalized_best_inference_only.pth",
                                   map_location=device, weights_only=False)
+personal_model_eval = PersonalizedMLP(num_users=_p_eval_state["user_embedding.weight"].shape[0],
+                                      user_dim=_p_eval_state["user_embedding.weight"].shape[1])
+personal_model_eval.load_state_dict(_p_eval_state)
+personal_model_eval.to(device)
 personal_model_eval.eval()
 
 print(f"Personalized test set: {len(personal_test)} rows, "
@@ -1499,6 +1755,50 @@ test_dataset = datasets.ImageFolder(root=os.path.join(data_dir, 'inference'), tr
 test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False, num_workers=4)
 ```
 
+```python
+# runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+
 
 
 
@@ -1507,9 +1807,11 @@ First, let's load our saved PyTorch model, and convert it to ONNX using PyTorch'
 
 ```python
 # runs in jupyter container on node-serve-model
-model_path = "models/flickr_global_best_inference_only.pth"  
+model_path = "models/inference_only/flickr_global_best_inference_only.pth"  
 device = torch.device("cpu")
-model = torch.load(model_path, map_location=device, weights_only=False)
+model = GlobalMLP()
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=False))
+model.eval()
 
 onnx_model_path = "models/flickr_global.onnx"
 # MLP expects a 768-dim CLIP embedding as input
@@ -1705,7 +2007,7 @@ These metrics show how well the **FP32 ONNX model** predicts aesthetic scores on
 # runs in jupyter container on node-serve-model
 # Quality metrics: full test split — Global FP32 ONNX baseline
 global_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-test_g_q = global_manifest_q[global_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_g_q = global_manifest_q[global_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_q = os.path.join(data_dir, "40K")
 print(f"Test set: {len(test_g_q)} images — running CLIP encoding + ONNX inference...")
 print("(GPU CLIP encoding — should complete in 1-3 minutes.)")
@@ -1842,8 +2144,13 @@ The personalized model takes two inputs: a 768-dim CLIP embedding and a user ind
 ```python
 # runs in jupyter container on node-serve-model
 # Load personalized model and get valid user indices
-personal_model_path = "models/flickr_personalized_best_inference_only.pth"
-personal_model = torch.load(personal_model_path, map_location=device, weights_only=False)
+personal_model_path = "models/inference_only/flickr_personalized_best_inference_only.pth"
+_p_state = torch.load(personal_model_path, map_location=device, weights_only=False)
+_num_users = _p_state["user_embedding.weight"].shape[0]
+_user_dim = _p_state["user_embedding.weight"].shape[1]
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
+personal_model.load_state_dict(_p_state)
+personal_model.eval()
 
 data_dir = os.getenv("AESTHETIC_DATA_DIR", "flickr-aes")
 personal_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
@@ -2029,7 +2336,7 @@ Per-user SRCC and MAE across every annotator in the test split.
 # runs in jupyter container on node-serve-model
 # Quality metrics: Personalized FP32 ONNX — per-user SRCC and MAE
 p_manifest_q = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-test_p_q = p_manifest_q[p_manifest_q["split"] == "inference"].reset_index(drop=True)
+test_p_q = p_manifest_q[p_manifest_q["split"] == "test"].reset_index(drop=True)
 image_root_p = os.path.join(data_dir, "40K")
 input_names_p = [i.name for i in personal_ort_session.get_inputs()]
 test_workers_q = [w for w in test_p_q["worker_id"].unique() if w in user2idx]
@@ -2163,7 +2470,7 @@ print("Pre-computing test embeddings for quality metrics...")
 print("(GPU CLIP encoding over the test set — should complete in 1-3 minutes.)")
 
 _g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-_test_g = _g_manifest[_g_manifest["split"] == "inference"].reset_index(drop=True)
+_test_g = _g_manifest[_g_manifest["split"] == "test"].reset_index(drop=True)
 _img_root = os.path.join(data_dir, "40K")
 
 _qm_g_embs_list, _qm_g_tgts = [], []
@@ -2188,7 +2495,7 @@ _qm_g_embs = np.concatenate(_qm_g_embs_list, axis=0)
 _qm_g_tgts = np.array(_qm_g_tgts, dtype=np.float32)
 
 _p_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-_test_p = _p_manifest[_p_manifest["split"] == "inference"].reset_index(drop=True)
+_test_p = _p_manifest[_p_manifest["split"] == "test"].reset_index(drop=True)
 _seen_w = sorted(_p_manifest.loc[_p_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
 _user2idx_qm = {u: i for i, u in enumerate(_seen_w)}
 
@@ -2507,7 +2814,12 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/flickr_global_quantized_dynamic.onnx")
+if q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy(model_path, "models/flickr_global_quantized_dynamic.onnx")
+else:
+    q_model.save_model_to_file("models/flickr_global_quantized_dynamic.onnx")
 ```
 
 
@@ -2582,7 +2894,12 @@ Apply dynamic quantization to the personalized model.
 personal_fp32 = neural_compressor.model.onnx_model.ONNXModel("models/flickr_personalized.onnx")
 config_ptq = neural_compressor.PostTrainingQuantConfig(approach="dynamic")
 p_q_model = quantization.fit(model=personal_fp32, conf=config_ptq)
-p_q_model.save_model_to_file("models/flickr_personalized_quantized_dynamic.onnx")
+if p_q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy("models/flickr_personalized.onnx", "models/flickr_personalized_quantized_dynamic.onnx")
+else:
+    p_q_model.save_model_to_file("models/flickr_personalized_quantized_dynamic.onnx")
 ```
 
 ```python
@@ -2665,7 +2982,12 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/flickr_global_quantized_aggressive.onnx")
+if q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy(model_path, "models/flickr_global_quantized_aggressive.onnx")
+else:
+    q_model.save_model_to_file("models/flickr_global_quantized_aggressive.onnx")
 ```
 
 
@@ -2767,7 +3089,12 @@ q_model = quantization.fit(
 )
 
 # Save quantized model
-q_model.save_model_to_file("models/flickr_global_quantized_conservative.onnx")
+if q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy(model_path, "models/flickr_global_quantized_conservative.onnx")
+else:
+    q_model.save_model_to_file("models/flickr_global_quantized_conservative.onnx")
 ```
 
 
@@ -2859,12 +3186,23 @@ Apply the same static quantization approaches to the personalized model. We need
 
 ```python
 # runs in jupyter container on node-serve-model
-# Prepare calibration dataloader for personalized model (two inputs)
+# Prepare calibration dataloader for personalized model (two inputs).
+# INC DataLoader expects (data, label) tuples. For multi-input models,
+# 'data' must itself be a list/tuple so INC passes each element as a
+# separate input tensor. We use a lightweight wrapper to yield
+# ([embedding, user_idx], dummy_label).
 p_cal_user_idx = np.zeros(len(cal_embeddings), dtype=np.int64)
-p_cal_dataset = TensorDataset(
-    torch.from_numpy(cal_embeddings), 
-    torch.from_numpy(p_cal_user_idx)
-)
+
+class _MultiInputCalDataset:
+    def __init__(self, embeddings, user_idx):
+        self._emb = embeddings
+        self._uid = user_idx
+    def __len__(self):
+        return len(self._emb)
+    def __getitem__(self, idx):
+        return [self._emb[idx], self._uid[idx]], 0
+
+p_cal_dataset = _MultiInputCalDataset(cal_embeddings, p_cal_user_idx)
 p_cal_dataloader = neural_compressor.data.DataLoader(framework='onnxruntime', dataset=p_cal_dataset)
 ```
 
@@ -2886,7 +3224,12 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
 p_q_model = quantization.fit(
     model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
 )
-p_q_model.save_model_to_file("models/flickr_personalized_quantized_aggressive.onnx")
+if p_q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy("models/flickr_personalized.onnx", "models/flickr_personalized_quantized_aggressive.onnx")
+else:
+    p_q_model.save_model_to_file("models/flickr_personalized_quantized_aggressive.onnx")
 ```
 
 ```python
@@ -2920,7 +3263,12 @@ config_ptq = neural_compressor.PostTrainingQuantConfig(
 p_q_model = quantization.fit(
     model=personal_fp32, conf=config_ptq, calib_dataloader=p_cal_dataloader
 )
-p_q_model.save_model_to_file("models/flickr_personalized_quantized_conservative.onnx")
+if p_q_model is None:
+    print("WARNING: quantization.fit() returned None — saving original FP32 model as fallback.")
+    import shutil
+    shutil.copy("models/flickr_personalized.onnx", "models/flickr_personalized_quantized_conservative.onnx")
+else:
+    p_q_model.save_model_to_file("models/flickr_personalized_quantized_conservative.onnx")
 ```
 
 ```python
@@ -3044,12 +3392,56 @@ print("ResourceMonitor ready.")
 
 ```python
 # runs in jupyter container on node-serve-model
+import torch.nn as nn
+
+class GlobalMLP(nn.Module):
+    def __init__(self, input_dim=768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x):
+        return torch.sigmoid(self.net(x))
+
+class PersonalizedMLP(nn.Module):
+    def __init__(self, num_users, input_dim=768, user_dim=64):
+        super().__init__()
+        self.user_embedding = nn.Embedding(num_users, user_dim)
+        self.net = nn.Sequential(
+            nn.Linear(input_dim + user_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(512, 128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 32),
+            nn.ReLU(),
+            nn.Linear(32, 1),
+        )
+
+    def forward(self, x, user_idx):
+        u = self.user_embedding(user_idx)
+        z = torch.cat([x, u], dim=-1)
+        return torch.sigmoid(self.net(z))
+```
+
+```python
+# runs in jupyter container on node-serve-model
 # Load CLIP model on GPU
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 if device.type == "cuda":
     print(f"GPU: {torch.cuda.get_device_name(0)}")
-    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_mem / (1024**3):.1f} GB")
+    print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.1f} GB")
 
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
@@ -3209,7 +3601,8 @@ Let's measure the full pipeline on GPU: image → ViT (GPU) → normalize → ML
 clip_model, clip_preprocess = clip.load("ViT-L/14", device=device)
 
 # Load MLP on CPU
-mlp_model = torch.load("models/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False)
+mlp_model = GlobalMLP()
+mlp_model.load_state_dict(torch.load("models/inference_only/flickr_global_best_inference_only.pth", map_location=torch.device("cpu"), weights_only=False))
 mlp_model.eval()
 
 num_trials = 50
@@ -3279,7 +3672,11 @@ We repeat the end-to-end measurement with the **PersonalizedMLP**, which takes a
 ```python
 # runs in jupyter container on node-serve-model
 # Load personalized model and prepare user indices
-personal_model = torch.load("models/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+_p_state = torch.load("models/inference_only/flickr_personalized_best_inference_only.pth", map_location="cpu", weights_only=False)
+_num_users = _p_state["user_embedding.weight"].shape[0]
+_user_dim  = _p_state["user_embedding.weight"].shape[1]
+personal_model = PersonalizedMLP(num_users=_num_users, user_dim=_user_dim)
+personal_model.load_state_dict(_p_state)
 personal_model.eval()
 
 manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
@@ -3545,7 +3942,7 @@ TensorRT on Ampere GPUs may silently apply FP16 precision, which can degrade pre
 # Pre-compute all test embeddings on GPU (one-time; used for TRT quality checks below)
 print("Pre-computing test embeddings on GPU for TRT quality verification...")
 _trt_g_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_global_manifest.csv"))
-_trt_test_g = _trt_g_manifest[_trt_g_manifest["split"] == "inference"].reset_index(drop=True)
+_trt_test_g = _trt_g_manifest[_trt_g_manifest["split"] == "test"].reset_index(drop=True)
 _trt_img_root = os.path.join(data_dir, "40K")
 
 _trt_g_embs_list, _trt_g_tgts = [], []
@@ -3568,7 +3965,7 @@ _trt_g_embs = np.concatenate(_trt_g_embs_list, axis=0)
 _trt_g_tgts = np.array(_trt_g_tgts, dtype=np.float32)
 
 _trt_p_manifest = pd.read_csv(os.path.join(data_dir, "splits", "flickr_personalized_manifest.csv"))
-_trt_test_p = _trt_p_manifest[_trt_p_manifest["split"] == "inference"].reset_index(drop=True)
+_trt_test_p = _trt_p_manifest[_trt_p_manifest["split"] == "test"].reset_index(drop=True)
 _trt_seen_w = sorted(_trt_p_manifest.loc[_trt_p_manifest["worker_split"] == "seen_worker_pool", "worker_id"].unique())
 _trt_user2idx = {u: i for i, u in enumerate(_trt_seen_w)}
 
@@ -3642,6 +4039,11 @@ print(f"  Binary accuracy:  {_trt_acc:.4f}  (threshold=0.5)")
 print(f"  AUC-ROC:          {_trt_auc:.4f}")
 print("Compare with FP32 CUDA EP metrics: any drop indicates TF32/FP16 precision trade-off.")
 print("(On Ampere/A100, TRT defaults to TF32 for matmuls; FP16 requires explicit trt_fp16_enable=True.)")
+```
+
+```python
+# runs in jupyter container on node-serve-model
+# Personalized MLP - TensorRT execution provider
 personal_onnx_path = "models/flickr_personalized.onnx"
 monitor.start()
 ort_session = ort.InferenceSession(personal_onnx_path, providers=['TensorrtExecutionProvider'])
@@ -3672,6 +4074,7 @@ print(f"  Mean per-user SRCC: {np.mean(_trt_per_srcc):.4f}")
 print(f"  Mean per-user MAE:  {np.mean(_trt_per_mae):.4f}")
 print("Compare with FP32 CUDA EP metrics: any drop indicates TF32/FP16 precision trade-off.")
 print("(On Ampere/A100, TRT defaults to TF32 for matmuls; FP16 requires explicit trt_fp16_enable=True.)")
+```
 
 
 
@@ -3787,14 +4190,22 @@ docker stop jupyter
 docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml up -d
 ```
 
-4. Get the Jupyter token:
+4. To access the Jupyter service, we will need its randomly generated secret token (which secures it from unauthorized access). Run
 
 ```bash
 # runs on node-serve-model
 docker exec jupyter_fastapi jupyter server list
 ```
 
-5. Open this notebook in the Jupyter container at `http://<FLOATING_IP>:8888`.
+and look for a line like
+
+```
+http://localhost:8888/?token=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+```
+
+Paste this into a browser tab, but in place of `localhost`, substitute the floating IP assigned to your instance, to open the Jupyter notebook interface that is running *on your compute instance*.
+
+Then, in the file browser on the left side, open the "work" directory and then click on the `9_fastapi_benchmark.ipynb` notebook to continue.
 
 
 ```python
@@ -4169,14 +4580,20 @@ docker logs triton_server 2>&1 | tail -5
 
 You should see `Started GRPCInferenceService` and `Started HTTPService`.
 
-5. Get the Jupyter token:
+5. To access the Jupyter service, we will need its randomly generated secret token (which secures it from unauthorized access). Run
 
 ```bash
 # runs on node-serve-model
 docker exec jupyter_triton jupyter server list
 ```
 
-6. Open this notebook at `http://<FLOATING_IP>:8888`.
+   and look for a line like
+
+       http://localhost:8888/?token=XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+   Paste this into a browser tab, but in place of `localhost`, substitute the floating IP assigned to your instance, to open the Jupyter notebook interface that is running *on your compute instance*.
+
+   Then, in the file browser on the left side, open the "work" directory and then click on the `10_triton_benchmark.ipynb` notebook to continue.
 
 
 ```python
@@ -4490,32 +4907,23 @@ print(f"  Throughput:           {pb_throughput:.2f} samples/s")
 
 ## Part 4: `perf_analyzer` Benchmarks
 
-Triton ships `perf_analyzer` inside its container. We can run it from the host or install it in another container. For convenience, we'll run it from the Jupyter container.
+`perf_analyzer` is Triton's official load-testing CLI. It lives in the **SDK image** (`tritonserver:24.10-py3-sdk`), not the server image, so the compose file includes a lightweight `triton_sdk` sidecar container that shares the server's network namespace.
 
-Note: `perf_analyzer` generates synthetic input data matching the model's input shape.
-
-### Install perf_analyzer
-
-If `perf_analyzer` is not already available in your Jupyter container, run it from the Triton container instead:
-
-```bash
-# runs on node-serve-model
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --concurrency-range 1
-```
+The tool generates synthetic input tensors matching the model's input shape, fires them at the server, and reports precise latency breakdowns (queue time, compute time) and throughput.
 
 ### Concurrency sweep — Global MLP
 
-Run these commands from the **host** (or from inside the Triton container):
+Run these commands on the **host** (SSH into `node-serve-model`):
 
 ```bash
 # Concurrency = 1 (baseline)
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 1
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 1
 
 # Concurrency = 8
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
 
 # Concurrency = 16
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 16
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 16
 ```
 
 Record the **average request latency** and its breakdown:
@@ -4537,11 +4945,11 @@ Record the **average request latency** and its breakdown:
 Test different batch sizes with a single concurrent client:
 
 ```bash
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1  --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 8  --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 16 --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 32 --shape input:768 --concurrency-range 1
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 64 --shape input:768 --concurrency-range 1
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1  --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 8  --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 16 --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 32 --shape input:768 --concurrency-range 1 --measurement-interval 10000
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 64 --shape input:768 --concurrency-range 1 --measurement-interval 10000
 ```
 
 
@@ -4598,7 +5006,7 @@ docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up tr
 
 Wait for it to be ready, then benchmark:
 ```bash
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --concurrency-range 8
 ```
 
 Compare queue delay and throughput vs the single-instance case.
@@ -4637,13 +5045,13 @@ Restart Triton, then test with Poisson arrivals at various request rates:
 
 ```bash
 # Without dynamic batching (comment it out first for comparison)
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
 
 # With dynamic batching
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 200 --request-distribution poisson
 
 # Higher request rate with dynamic batching
-docker exec triton_server perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 500 --request-distribution poisson
+docker exec triton_sdk perf_analyzer -u localhost:8000 -m flickr_global -b 1 --shape input:768 --request-rate-range 500 --request-distribution poisson
 ```
 
 Check batch statistics:
