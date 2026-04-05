@@ -8,7 +8,7 @@ Inside the SSH session, build the `jupyter-onnx-gpu` image (includes CUDA, Tenso
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-gpu -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-nvidia .
+docker build -t jupyter-onnx-gpu -f aesthetic-hub-serving/docker/Dockerfile.jupyter-onnx-nvidia .
 ```
 
 Then, launch a container from the `jupyter-onnx-gpu` image with GPU access:
@@ -18,7 +18,7 @@ Then, launch a container from the `jupyter-onnx-gpu` image with GPU access:
 docker run  -d --rm  -p 8888:8888 \
     --gpus all \
     --shm-size 16G \
-    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v ~/aesthetic-hub-serving/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \

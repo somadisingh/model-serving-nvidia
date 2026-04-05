@@ -882,7 +882,7 @@ Build the OpenVINO image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-openvino -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-openvino .
+docker build -t jupyter-onnx-openvino -f aesthetic-hub-serving/docker/Dockerfile.jupyter-onnx-openvino .
 ```
 
 Then, launch a container with the OpenVINO image:
@@ -891,7 +891,7 @@ Then, launch a container with the OpenVINO image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v ~/aesthetic-hub-serving/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \

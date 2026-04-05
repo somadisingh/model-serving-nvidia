@@ -10,7 +10,7 @@ EP_SNIPPET := snippets/ep_onnx_nvidia.md
 
 all: build
 
-build: $(INDEX_NVIDIA_OUT) $(INDEX_OUT) 0_intro.ipynb 1_create_lease.ipynb 2_create_server.ipynb 3_prepare_data.ipynb 4_launch_jupyter.ipynb workspace/5_measure_torch.ipynb workspace/6_measure_onnx.ipynb workspace/7_optimize_onnx.ipynb workspace/8_ep_onnx.ipynb workspace/9_fastapi_benchmark.ipynb workspace/10_triton_benchmark.ipynb
+build: $(INDEX_NVIDIA_OUT) $(INDEX_OUT) 0_intro.ipynb 1_create_lease.ipynb 2_create_server.ipynb 3_prepare_data.ipynb 4_launch_jupyter.ipynb workspace/5_measure_torch.ipynb workspace/6_measure_onnx.ipynb workspace/7_optimize_onnx.ipynb workspace/8_ep_onnx.ipynb workspace/9_fastapi_benchmark.ipynb workspace/10_triton_benchmark.ipynb workspace/11_hub_production.ipynb
 
 clean:
 	rm -f $(INDEX_OUT) $(INDEX_NVIDIA_OUT) \
@@ -24,7 +24,8 @@ clean:
 		workspace/7_optimize_onnx.ipynb \
 		workspace/8_ep_onnx.ipynb \
 		workspace/9_fastapi_benchmark.ipynb \
-		workspace/10_triton_benchmark.ipynb
+		workspace/10_triton_benchmark.ipynb \
+		workspace/11_hub_production.ipynb
 
 $(INDEX_NVIDIA_OUT): snippets/intro_nvidia.md snippets/create_lease_nvidia.md snippets/create_server_nvidia.md snippets/prepare_data.md snippets/launch_jupyter.md snippets/measure_torch.md snippets/measure_onnx.md snippets/optimize_onnx.md snippets/ep_onnx_nvidia.md snippets/fastapi_benchmark.md snippets/triton_benchmark.md snippets/footer.md
 	cat snippets/intro_nvidia.md \
@@ -111,3 +112,9 @@ workspace/10_triton_benchmark.ipynb: snippets/triton_benchmark.md
 				-i snippets/frontmatter_python.md snippets/triton_benchmark.md \
 				-o workspace/10_triton_benchmark.ipynb
 	sed -i 's/attachment://g' workspace/10_triton_benchmark.ipynb
+
+workspace/11_hub_production.ipynb: snippets/11_hub_production.md
+	pandoc --resource-path=../ --embed-resources --standalone --wrap=none \
+				-i snippets/frontmatter_python.md snippets/11_hub_production.md \
+				-o workspace/11_hub_production.ipynb
+	sed -i 's/attachment://g' workspace/11_hub_production.ipynb

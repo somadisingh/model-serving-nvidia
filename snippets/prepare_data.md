@@ -24,7 +24,7 @@ Then, to populate it with data, run
 
 ```bash
 # runs on node-serve-model
-docker compose -f model-serving-nvidia/docker/docker-compose-data.yaml up
+docker compose -f aesthetic-hub-serving/docker/docker-compose-data.yaml up
 ```
 
 This will run a temporary container that uses `gdown` to download the Flickr-AES images (~6 GB zip) from Google Drive, extracts them, and also downloads the split manifest CSVs. It may take several minutes depending on your connection speed. You can monitor progress in the terminal output, or verify completion with:

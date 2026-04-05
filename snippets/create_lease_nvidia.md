@@ -46,6 +46,6 @@ At the beginning of your GPU lease time, you will continue with the next step, i
 * Use this link: [Model Optimizations for Aesthetic Score Prediction](https://chameleoncloud.org/experiment/share/c347ab71-1a5b-41cf-a2fd-0c34d30f1e1d) on Trovi
 * Then, click "Launch on Chameleon". This will start a new Jupyter server for you, with the experiment materials already in it, including the notebook to bring up the bare metal server.
 
-Inside the `model-serving-nvidia` directory, continue with `2_create_server.ipynb`.
+Inside the `aesthetic-hub-serving` directory, continue with `2_create_server.ipynb`.
 
 :::

@@ -29,7 +29,7 @@ docker stop jupyter
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml up -d
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-fastapi.yaml up -d
 ```
 
 4. To access the Jupyter service, we will need its randomly generated secret token (which secures it from unauthorized access). Run
@@ -426,7 +426,7 @@ Then, bring down the FastAPI service:
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml down
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-fastapi.yaml down
 ```
 
 :::

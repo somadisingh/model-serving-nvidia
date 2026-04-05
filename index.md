@@ -82,7 +82,7 @@ At the beginning of your GPU lease time, you will continue with the next step, i
 * Use this link: [Model Optimizations for Aesthetic Score Prediction](https://chameleoncloud.org/experiment/share/c347ab71-1a5b-41cf-a2fd-0c34d30f1e1d) on Trovi
 * Then, click "Launch on Chameleon". This will start a new Jupyter server for you, with the experiment materials already in it, including the notebook to bring up the bare metal server.
 
-Inside the `model-serving-nvidia` directory, continue with `2_create_server.ipynb`.
+Inside the `aesthetic-hub-serving` directory, continue with `2_create_server.ipynb`.
 
 
 
@@ -104,7 +104,7 @@ import os
 
 context.version = "1.0" 
 context.choose_project()
-context.choose_site(default="CHI@TACC")
+context.choose_site(default="CHI@UC")
 ```
 
 
@@ -113,7 +113,7 @@ Change the string in the following cell to reflect the name of *your* lease (**w
 
 ```python
 # runs in Chameleon Jupyter environment
-l = lease.get_lease(f"serve_model_netID") 
+l = lease.get_lease(f"proj21_serving") 
 l.show()
 ```
 
@@ -136,7 +136,7 @@ We will use the lease to bring up a server with the `CC-Ubuntu24.04-CUDA` disk i
 # runs in Chameleon Jupyter environment
 username = os.getenv('USER') # all exp resources will have this prefix
 s = server.Server(
-    f"node-serve-model-{username}", 
+    f"proj21-serving-{username}", 
     reservation_id=l.node_reservations[0]["id"],
     image_name="CC-Ubuntu24.04-CUDA"
 )
@@ -183,7 +183,7 @@ Now, we can use `python-chi` to execute commands on the instance, to set it up. 
 
 ```python
 # runs in Chameleon Jupyter environment
-s.execute("git clone -b main https://github.com/somadisingh/model-serving-nvidia")
+s.execute("git clone -b main https://github.com/somadisingh/aesthetic-hub-serving")
 ```
 
 
@@ -260,7 +260,7 @@ Then, to populate it with data, run
 
 ```bash
 # runs on node-serve-model
-docker compose -f model-serving-nvidia/docker/docker-compose-data.yaml up
+docker compose -f aesthetic-hub-serving/docker/docker-compose-data.yaml up
 ```
 
 This will run a temporary container that uses `gdown` to download the Flickr-AES images (~6 GB zip) from Google Drive, extracts them, and also downloads the split manifest CSVs. It may take several minutes depending on your connection speed. You can monitor progress in the terminal output, or verify completion with:
@@ -289,7 +289,7 @@ Inside the SSH session, build the `jupyter-onnx-gpu` image (includes CUDA, Tenso
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-gpu -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-nvidia .
+docker build -t jupyter-onnx-gpu -f aesthetic-hub-serving/docker/Dockerfile.jupyter-onnx-nvidia .
 ```
 
 Then, launch a container from the `jupyter-onnx-gpu` image with GPU access:
@@ -299,7 +299,7 @@ Then, launch a container from the `jupyter-onnx-gpu` image with GPU access:
 docker run  -d --rm  -p 8888:8888 \
     --gpus all \
     --shm-size 16G \
-    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v ~/aesthetic-hub-serving/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \
@@ -4096,7 +4096,7 @@ Build the OpenVINO image:
 
 ```bash
 # runs on node-serve-model
-docker build -t jupyter-onnx-openvino -f model-serving-nvidia/docker/Dockerfile.jupyter-onnx-openvino .
+docker build -t jupyter-onnx-openvino -f aesthetic-hub-serving/docker/Dockerfile.jupyter-onnx-openvino .
 ```
 
 Then, launch a container with the OpenVINO image:
@@ -4105,7 +4105,7 @@ Then, launch a container with the OpenVINO image:
 # runs on node-serve-model
 docker run  -d --rm  -p 8888:8888 \
     --shm-size 16G \
-    -v ~/model-serving-nvidia/workspace:/home/jovyan/work/ \
+    -v ~/aesthetic-hub-serving/workspace:/home/jovyan/work/ \
     -v aesthetic_data:/mnt/ \
     -e AESTHETIC_DATA_DIR=/mnt/flickr-aes \
     --name jupyter \
@@ -4187,7 +4187,7 @@ docker stop jupyter
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml up -d
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-fastapi.yaml up -d
 ```
 
 4. To access the Jupyter service, we will need its randomly generated secret token (which secures it from unauthorized access). Run
@@ -4538,7 +4538,7 @@ Then, bring down the FastAPI service:
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-fastapi.yaml down
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-fastapi.yaml down
 ```
 
 
@@ -4560,15 +4560,15 @@ Before running this notebook:
 
 ```bash
 # runs on node-serve-model
-cp ~/model-serving-nvidia/workspace/models/flickr_global.onnx ~/model-serving-nvidia/models_triton/flickr_global/1/model.onnx
-cp ~/model-serving-nvidia/workspace/models/flickr_personalized.onnx ~/model-serving-nvidia/models_triton/flickr_personalized/1/model.onnx
+cp ~/aesthetic-hub-serving/workspace/models/flickr_global.onnx ~/aesthetic-hub-serving/models_triton/flickr_global/1/model.onnx
+cp ~/aesthetic-hub-serving/workspace/models/flickr_personalized.onnx ~/aesthetic-hub-serving/models_triton/flickr_personalized/1/model.onnx
 ```
 
 3. Bring up the Triton containers:
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up -d
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-triton.yaml up -d
 ```
 
 4. Verify the server is ready:
@@ -4975,7 +4975,7 @@ On the host, edit the config:
 
 ```bash
 # runs on node-serve-model
-nano ~/model-serving-nvidia/models_triton/flickr_global/config.pbtxt
+nano ~/aesthetic-hub-serving/models_triton/flickr_global/config.pbtxt
 ```
 
 Change:
@@ -5001,7 +5001,7 @@ instance_group [
 
 Restart Triton:
 ```bash
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up triton_server --force-recreate -d
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-triton.yaml up triton_server --force-recreate -d
 ```
 
 Wait for it to be ready, then benchmark:
@@ -5030,7 +5030,7 @@ Dynamic batching lets Triton combine multiple individual requests into a batch a
 Reset to 1 instance, then edit `config.pbtxt`:
 
 ```bash
-nano ~/model-serving-nvidia/models_triton/flickr_global/config.pbtxt
+nano ~/aesthetic-hub-serving/models_triton/flickr_global/config.pbtxt
 ```
 
 Add at the end:
@@ -5091,7 +5091,7 @@ Then, bring down the Triton service:
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml down
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-triton.yaml down
 ```
 
 

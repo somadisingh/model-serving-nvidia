@@ -18,15 +18,15 @@ Before running this notebook:
 
 ```bash
 # runs on node-serve-model
-cp ~/model-serving-nvidia/workspace/models/flickr_global.onnx ~/model-serving-nvidia/models_triton/flickr_global/1/model.onnx
-cp ~/model-serving-nvidia/workspace/models/flickr_personalized.onnx ~/model-serving-nvidia/models_triton/flickr_personalized/1/model.onnx
+cp ~/aesthetic-hub-serving/workspace/models/flickr_global.onnx ~/aesthetic-hub-serving/models_triton/flickr_global/1/model.onnx
+cp ~/aesthetic-hub-serving/workspace/models/flickr_personalized.onnx ~/aesthetic-hub-serving/models_triton/flickr_personalized/1/model.onnx
 ```
 
 3. Bring up the Triton containers:
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up -d
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-triton.yaml up -d
 ```
 
 4. Verify the server is ready:
@@ -481,7 +481,7 @@ On the host, edit the config:
 
 ```bash
 # runs on node-serve-model
-nano ~/model-serving-nvidia/models_triton/flickr_global/config.pbtxt
+nano ~/aesthetic-hub-serving/models_triton/flickr_global/config.pbtxt
 ```
 
 Change:
@@ -507,7 +507,7 @@ instance_group [
 
 Restart Triton:
 ```bash
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml up triton_server --force-recreate -d
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-triton.yaml up triton_server --force-recreate -d
 ```
 
 Wait for it to be ready, then benchmark:
@@ -540,7 +540,7 @@ Dynamic batching lets Triton combine multiple individual requests into a batch a
 Reset to 1 instance, then edit `config.pbtxt`:
 
 ```bash
-nano ~/model-serving-nvidia/models_triton/flickr_global/config.pbtxt
+nano ~/aesthetic-hub-serving/models_triton/flickr_global/config.pbtxt
 ```
 
 Add at the end:
@@ -609,7 +609,7 @@ Then, bring down the Triton service:
 
 ```bash
 # runs on node-serve-model
-docker compose -f ~/model-serving-nvidia/docker/docker-compose-triton.yaml down
+docker compose -f ~/aesthetic-hub-serving/docker/docker-compose-triton.yaml down
 ```
 
 :::

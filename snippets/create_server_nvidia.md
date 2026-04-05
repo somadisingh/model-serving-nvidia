@@ -21,7 +21,7 @@ import os
 
 context.version = "1.0" 
 context.choose_project()
-context.choose_site(default="CHI@TACC")
+context.choose_site(default="CHI@UC")
 ```
 :::
 
@@ -34,7 +34,7 @@ Change the string in the following cell to reflect the name of *your* lease (**w
 ::: {.cell .code}
 ```python
 # runs in Chameleon Jupyter environment
-l = lease.get_lease(f"serve_model_netID") 
+l = lease.get_lease(f"proj21_serving") 
 l.show()
 ```
 :::
@@ -63,7 +63,7 @@ We will use the lease to bring up a server with the `CC-Ubuntu24.04-CUDA` disk i
 # runs in Chameleon Jupyter environment
 username = os.getenv('USER') # all exp resources will have this prefix
 s = server.Server(
-    f"node-serve-model-{username}", 
+    f"proj21-serving-{username}", 
     reservation_id=l.node_reservations[0]["id"],
     image_name="CC-Ubuntu24.04-CUDA"
 )
@@ -126,7 +126,7 @@ Now, we can use `python-chi` to execute commands on the instance, to set it up. 
 ::: {.cell .code}
 ```python
 # runs in Chameleon Jupyter environment
-s.execute("git clone -b main https://github.com/somadisingh/model-serving-nvidia")
+s.execute("git clone -b main https://github.com/somadisingh/aesthetic-hub-serving")
 ```
 :::
 
