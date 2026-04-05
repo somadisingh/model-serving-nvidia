@@ -921,8 +921,8 @@ for model_name in ["flickr_global", "flickr_personalized"]:
         if batch_stats:
             print(f"  Batch size distribution:")
             for bs in batch_stats:
-                count = bs.get("inference_stats", {}).get("success", {}).get("count", 0)
-                print(f"    batch_size={bs.get('batch_size', '?')}: {count} inferences")
+                count = bs.get("compute_infer", {}).get("count", 0)
+                print(f"    batch_size={bs.get('batch_size', '?'):>3}: {count:>8} batches executed")
     except Exception as e:
         print(f"  Could not fetch stats for {model_name}: {e}")
 ```
@@ -1038,6 +1038,304 @@ dynamic_batching: { preferred_batch_size: [4, 8, 16, 32, 64, 128], max_queue_del
 - **max_queue_delay 50 µs**: Low enough to not add perceptible latency for sparse arrivals
 - **Always-on server**: Users across time zones — no good maintenance window
 
+:::
+
+::: {.cell .markdown}
+
+---
+
+## Part 5: gRPC Benchmarks
+
+Triton also exposes a gRPC endpoint on port 8001. gRPC uses binary serialization (protobuf) and HTTP/2, which typically gives lower latency and higher throughput than the HTTP/REST endpoint — especially for small payloads like our 768-dim embeddings.
+
+We repeat the same benchmarks using the gRPC client to compare.
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+import tritonclient.grpc as grpcclient
+
+TRITON_GRPC_URL = "triton_server:8001"
+grpc_client = grpcclient.InferenceServerClient(url=TRITON_GRPC_URL)
+
+print(f"gRPC server live:  {grpc_client.is_server_live()}")
+print(f"gRPC server ready: {grpc_client.is_server_ready()}")
+print()
+
+for model_name in ["flickr_global", "flickr_personalized"]:
+    ready = grpc_client.is_model_ready(model_name)
+    meta = grpc_client.get_model_metadata(model_name)
+    print(f"Model '{model_name}': ready={ready}")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+print("Triton gRPC endpoint URLs:")
+print(f"  gRPC:              {TRITON_GRPC_URL}")
+print(f"  (binary protobuf over HTTP/2 — no REST URLs)")
+print()
+print("Equivalent HTTP endpoints for reference:")
+print(f"  Health:            http://triton_server:8000/v2/health/ready")
+for model_name in ["flickr_global", "flickr_personalized"]:
+    print(f"  [{model_name}]")
+    print(f"    Inference:       http://triton_server:8000/v2/models/{model_name}/infer  (HTTP)")
+    print(f"    Inference:       triton_server:8001 → flickr_global.infer()  (gRPC)")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# gRPC helper functions
+def grpc_infer_global(client, embeddings):
+    inputs = [grpcclient.InferInput("input", embeddings.shape, "FP32")]
+    inputs[0].set_data_from_numpy(embeddings)
+    outputs = [grpcclient.InferRequestedOutput("output")]
+    result = client.infer(model_name="flickr_global", inputs=inputs, outputs=outputs)
+    return result.as_numpy("output")
+
+def grpc_infer_personalized(client, embeddings, user_indices):
+    inp_emb = grpcclient.InferInput("embedding", embeddings.shape, "FP32")
+    inp_emb.set_data_from_numpy(embeddings)
+    inp_idx = grpcclient.InferInput("user_idx", user_indices.shape, "INT64")
+    inp_idx.set_data_from_numpy(user_indices)
+    outputs = [grpcclient.InferRequestedOutput("output")]
+    result = client.infer(model_name="flickr_personalized", inputs=[inp_emb, inp_idx], outputs=outputs)
+    return result.as_numpy("output")
+
+# Sanity check
+scores = grpc_infer_global(grpc_client, single_emb)
+print(f"gRPC Global single:  {scores.flatten()[0]:.4f}")
+scores = grpc_infer_personalized(grpc_client, single_emb, single_user_idx)
+print(f"gRPC Personal single: {scores.flatten()[0]:.4f}")
+```
+:::
+
+::: {.cell .markdown}
+
+### Global MLP — gRPC Benchmark
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# gRPC: Global single-sample latency
+num_trials = 500
+
+for _ in range(20):
+    grpc_infer_global(grpc_client, single_emb)
+
+grpc_global_single = []
+for _ in range(num_trials):
+    start = time.time()
+    grpc_infer_global(grpc_client, single_emb)
+    grpc_global_single.append(time.time() - start)
+
+grpc_global_single = np.array(grpc_global_single)
+print(f"Global MLP — gRPC Single Sample (n={num_trials})")
+print(f"  Median latency:  {np.median(grpc_global_single)*1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(grpc_global_single, 95)*1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(grpc_global_single, 99)*1000:.2f} ms")
+print(f"  Throughput:      {num_trials / grpc_global_single.sum():.0f} infer/s")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# gRPC: Global batch=32
+num_trials = 200
+
+for _ in range(20):
+    grpc_infer_global(grpc_client, batch_32)
+
+grpc_global_b32 = []
+for _ in range(num_trials):
+    start = time.time()
+    grpc_infer_global(grpc_client, batch_32)
+    grpc_global_b32.append(time.time() - start)
+
+grpc_global_b32 = np.array(grpc_global_b32)
+grpc_g_b32_throughput = (num_trials * 32) / grpc_global_b32.sum()
+print(f"Global MLP — gRPC Batch=32 (n={num_trials})")
+print(f"  Median latency:  {np.median(grpc_global_b32)*1000:.2f} ms")
+print(f"  Throughput:      {grpc_g_b32_throughput:.0f} samples/s")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# gRPC: Global batch=64
+num_trials = 200
+
+for _ in range(20):
+    grpc_infer_global(grpc_client, batch_64)
+
+grpc_global_b64 = []
+for _ in range(num_trials):
+    start = time.time()
+    grpc_infer_global(grpc_client, batch_64)
+    grpc_global_b64.append(time.time() - start)
+
+grpc_global_b64 = np.array(grpc_global_b64)
+grpc_g_b64_throughput = (num_trials * 64) / grpc_global_b64.sum()
+print(f"Global MLP — gRPC Batch=64 (n={num_trials})")
+print(f"  Median latency:  {np.median(grpc_global_b64)*1000:.2f} ms")
+print(f"  Throughput:      {grpc_g_b64_throughput:.0f} samples/s")
+```
+:::
+
+::: {.cell .markdown}
+
+### Personalized MLP — gRPC Benchmark
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# gRPC: Personalized single-sample latency
+num_trials = 500
+
+for _ in range(20):
+    grpc_infer_personalized(grpc_client, single_emb, single_user_idx)
+
+grpc_personal_single = []
+for _ in range(num_trials):
+    start = time.time()
+    grpc_infer_personalized(grpc_client, single_emb, single_user_idx)
+    grpc_personal_single.append(time.time() - start)
+
+grpc_personal_single = np.array(grpc_personal_single)
+print(f"Personalized MLP — gRPC Single Sample (n={num_trials})")
+print(f"  Median latency:  {np.median(grpc_personal_single)*1000:.2f} ms")
+print(f"  95th percentile: {np.percentile(grpc_personal_single, 95)*1000:.2f} ms")
+print(f"  99th percentile: {np.percentile(grpc_personal_single, 99)*1000:.2f} ms")
+print(f"  Throughput:      {num_trials / grpc_personal_single.sum():.0f} infer/s")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# gRPC: Personalized batch=32
+num_trials = 200
+
+for _ in range(20):
+    grpc_infer_personalized(grpc_client, batch_32, batch_32_user_idx)
+
+grpc_personal_b32 = []
+for _ in range(num_trials):
+    start = time.time()
+    grpc_infer_personalized(grpc_client, batch_32, batch_32_user_idx)
+    grpc_personal_b32.append(time.time() - start)
+
+grpc_personal_b32 = np.array(grpc_personal_b32)
+grpc_p_b32_throughput = (num_trials * 32) / grpc_personal_b32.sum()
+print(f"Personalized MLP — gRPC Batch=32 (n={num_trials})")
+print(f"  Median latency:  {np.median(grpc_personal_b32)*1000:.2f} ms")
+print(f"  Throughput:      {grpc_p_b32_throughput:.0f} samples/s")
+```
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# gRPC: Personalized batch=64
+num_trials = 200
+
+for _ in range(20):
+    grpc_infer_personalized(grpc_client, batch_64, batch_64_user_idx)
+
+grpc_personal_b64 = []
+for _ in range(num_trials):
+    start = time.time()
+    grpc_infer_personalized(grpc_client, batch_64, batch_64_user_idx)
+    grpc_personal_b64.append(time.time() - start)
+
+grpc_personal_b64 = np.array(grpc_personal_b64)
+grpc_p_b64_throughput = (num_trials * 64) / grpc_personal_b64.sum()
+print(f"Personalized MLP — gRPC Batch=64 (n={num_trials})")
+print(f"  Median latency:  {np.median(grpc_personal_b64)*1000:.2f} ms")
+print(f"  Throughput:      {grpc_p_b64_throughput:.0f} samples/s")
+```
+:::
+
+::: {.cell .markdown}
+
+### HTTP vs gRPC Comparison
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+print("=" * 80)
+print("HTTP vs gRPC COMPARISON")
+print("=" * 80)
+
+print(f"\n{'Scenario':<40} {'HTTP (ms)':>10} {'gRPC (ms)':>10} {'Speedup':>10}")
+print("-" * 70)
+
+scenarios = [
+    ("Global single", np.median(global_triton_single), np.median(grpc_global_single)),
+    ("Global batch=32", np.median(global_triton_b32), np.median(grpc_global_b32)),
+    ("Global batch=64", np.median(global_triton_b64), np.median(grpc_global_b64)),
+    ("Personal single", np.median(personal_triton_single), np.median(grpc_personal_single)),
+    ("Personal batch=32", np.median(personal_triton_b32), np.median(grpc_personal_b32)),
+    ("Personal batch=64", np.median(personal_triton_b64), np.median(grpc_personal_b64)),
+]
+
+for name, http_ms, grpc_ms in scenarios:
+    speedup = http_ms / grpc_ms if grpc_ms > 0 else float('inf')
+    print(f"{name:<40} {http_ms*1000:>10.2f} {grpc_ms*1000:>10.2f} {speedup:>9.2f}x")
+```
+:::
+
+::: {.cell .markdown}
+
+### `perf_analyzer` — gRPC Benchmarks
+
+Run these on the **host** to compare gRPC vs HTTP with `perf_analyzer`:
+
+#### Global MLP — gRPC concurrency sweep
+
+```bash
+docker exec triton_production_sdk perf_analyzer -u localhost:8001 -i grpc -m flickr_global -b 1 --shape input:768 --concurrency-range 1
+docker exec triton_production_sdk perf_analyzer -u localhost:8001 -i grpc -m flickr_global -b 1 --shape input:768 --concurrency-range 8
+docker exec triton_production_sdk perf_analyzer -u localhost:8001 -i grpc -m flickr_global -b 1 --shape input:768 --concurrency-range 16
+```
+
+#### Personalized MLP — gRPC concurrency sweep
+
+```bash
+docker exec triton_production_sdk perf_analyzer -u localhost:8001 -i grpc -m flickr_personalized -b 1 --shape embedding:768 --shape user_idx:1 --concurrency-range 1
+docker exec triton_production_sdk perf_analyzer -u localhost:8001 -i grpc -m flickr_personalized -b 1 --shape embedding:768 --shape user_idx:1 --concurrency-range 8
+docker exec triton_production_sdk perf_analyzer -u localhost:8001 -i grpc -m flickr_personalized -b 1 --shape embedding:768 --shape user_idx:1 --concurrency-range 16
+```
+
+:::
+
+::: {.cell .code}
+```python
+# runs in jupyter container on node-serve-model
+# Placeholder: paste gRPC perf_analyzer results here
+# Global MLP (gRPC):
+#   Concurrency=1:  throughput=____ infer/sec, avg latency=____ usec
+#   Concurrency=8:  throughput=____ infer/sec, avg latency=____ usec
+#   Concurrency=16: throughput=____ infer/sec, avg latency=____ usec
+#
+# Personalized MLP (gRPC):
+#   Concurrency=1:  throughput=____ infer/sec, avg latency=____ usec
+#   Concurrency=8:  throughput=____ infer/sec, avg latency=____ usec
+#   Concurrency=16: throughput=____ infer/sec, avg latency=____ usec
+```
 :::
 
 ::: {.cell .markdown}
