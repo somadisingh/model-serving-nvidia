@@ -71,5 +71,5 @@ Production workload estimates (A100 GPU):
 | Many users, 1 photo each | b=1 | 8 | 13,661 infer/s | 564 µs | Dynamic batching |
 | Many users, many photos | b=1 | 16 | 22,085 infer/s | 711 µs | 2 instances + dynamic batching |
 
-Please note that the use of AI was made for editing and sanity checking the code. This repo was inspired by (this project)[https://github.com/teaching-on-testbeds/serve-model-chi]
+Please note that the use of AI was made for editing and sanity checking the code. This repo was inspired by [this project](https://github.com/teaching-on-testbeds/serve-model-chi)
 
